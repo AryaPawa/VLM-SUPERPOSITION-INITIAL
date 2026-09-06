@@ -36,11 +36,11 @@ def main():
     # ------------------------------------------------------------------ 1 #
     print("[token] N-sweep: compression drives read pressure and safety")
     if args.quick:
-        tok = token_sweep(F=128, d_eff=32, k_per_token=1,
+        tok = token_sweep(F_ref=32, d_eff=32, N_ref=32,
                           N_values=(2, 4, 8, 16, 24, 32), n_pairs=25, seed=0)
     else:
-        tok = token_sweep(F=256, d_eff=64, k_per_token=1,
-                          N_values=(2, 4, 8, 16, 24, 32, 48, 64), n_pairs=40, seed=0)
+        tok = token_sweep(F_ref=48, d_eff=48, N_ref=48,
+                          N_values=(2, 4, 8, 16, 24, 32, 40, 48), n_pairs=40, seed=0)
     tok_path = os.path.join(args.outdir, "token_sweep.csv")
     tok.to_csv(tok_path, index=False)
     figt = figure_token(tok, os.path.join(args.outdir, "figure_token.png"))
@@ -52,8 +52,9 @@ def main():
     # ------------------------------------------------------------------ 2 #
     print()
     print("[mask] gradient-masking probe (soft-top-k gate)")
-    # use a superposed token model so the behaviour is genuinely attackable
-    cfg = ToyConfig(F=128, d_eff=32, N=8, k_per_token=2, geometry="token",
+    # a superposed token model so the behaviour is genuinely attackable
+    # (F_ref=32, N_ref=32, N=8 -> F_rd = 32*32/8 = 128 features in d_eff=32)
+    cfg = ToyConfig(F=32, d_eff=32, N=8, N0=32, k_per_token=1, geometry="token",
                     monitor_rank=4, monitor_angle_deg=30.0, seed=1)
     model = ToyModel(cfg)
     rng = np.random.default_rng(0)
@@ -61,7 +62,7 @@ def main():
     rows = []
     for i in range(n_pairs):
         _, w_b, U = model.plant_pair(rng)
-        res = masking_demo(model.W, w_b, U, temp=0.05, beta=1.0, tau=0.5, seed=i)
+        res = masking_demo(model.W, w_b, U, seed=i)
         rows.append(dict(pair=i, S_nogate=res.S_nogate, S_naive=res.S_naive,
                          S_bpda=res.S_bpda, S_gradfree=res.S_gradfree,
                          masking_ratio=res.masking_ratio))

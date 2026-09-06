@@ -147,3 +147,146 @@ def delta_star_pgd(W: np.ndarray, w_b: np.ndarray, U: np.ndarray,
         if feas_behav and feas_mon:
             best = min(best, float(np.linalg.norm(dz)))
     return best
+
+
+# =========================================================================== #
+# Gradient-masking defense probe (R2 machinery, exercised in the toy).
+#
+# A "soft top-k" gate at the read position is a defense that LOOKS robust to a
+# naive gradient attacker but isn't: the gate zeroes small coordinates, so the
+# honest gradient of the behaviour read-out is ~0 exactly where the attacker
+# needs to push. A naive PGD therefore fails to raise the behaviour and reports a
+# large perturbation ("safe"). BPDA (straight-through backward pass) and a
+# gradient-free search push through the gate's cliff and recover the true, small
+# perturbation. This is the Athalye et al. obfuscated-gradients check in
+# miniature: it validates that our S_OC estimates measure real erosion, not a
+# gradient artefact.
+#
+# The probe is behaviour-only (raise w_b . gate(h) by >= beta) and operates at
+# the read position (eta in R^{d_eff}); it is deliberately separate from the
+# input-space S_OC above, which already handles monitor evasion. A baseline h0 is
+# constructed so the behaviour-carrying coordinates sit just BELOW the gate
+# threshold -- the regime where masking bites.
+# =========================================================================== #
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -50.0, 50.0)))
+
+
+@dataclass
+class MaskingResult:
+    S_nogate: float     # min ||eta|| with NO gate (linear reference)
+    S_naive: float      # masked PGD, honest gradient (inflated -> looks safe)
+    S_bpda: float       # straight-through backward pass (recovers true attack)
+    S_gradfree: float   # gradient-free search (independent confirmation)
+    budget: float       # perturbation cap; an attacker at the cap "failed"
+
+    @property
+    def masking_ratio(self) -> float:
+        base = min(self.S_bpda, self.S_gradfree)
+        return float(self.S_naive / max(base, 1e-12))
+
+
+def soft_top_k(h: np.ndarray, k: int, temp: float = 0.05) -> np.ndarray:
+    """Soft gate keeping the top-k coordinates by magnitude (differentiable)."""
+    k = int(np.clip(k, 1, h.shape[-1]))
+    thr = np.sort(np.abs(h))[-k]
+    return _sigmoid((np.abs(h) - thr) / temp) * h
+
+
+def _gate_diag_jac(h: np.ndarray, k: int, temp: float) -> np.ndarray:
+    """Diagonal of d(soft_top_k(h))/dh (threshold treated as constant)."""
+    k = int(np.clip(k, 1, h.shape[-1]))
+    thr = np.sort(np.abs(h))[-k]
+    g = _sigmoid((np.abs(h) - thr) / temp)
+    dg = g * (1.0 - g) * np.sign(h) / temp
+    return g + h * dg
+
+
+def _behaviour(h, w_b, k, temp):
+    return float(w_b @ soft_top_k(h, k, temp))
+
+
+def _pgd_behaviour(h0, w_b, k, temp, beta, straight_through, budget,
+                   steps=2000, restarts=6, lr=0.05, penalty=50.0, seed=0):
+    """Min ||eta|| s.t. gated behaviour rises by >= beta. Returns the achieved
+    ||eta|| if feasible, else ``budget`` (i.e. the attacker could not do better).
+    """
+    rng = np.random.default_rng(seed)
+    d = h0.shape[0]
+    beh0 = _behaviour(h0, w_b, k, temp)
+    best = budget
+    for _ in range(restarts):
+        eta = 0.01 * rng.standard_normal(d)
+        for _ in range(steps):
+            h = h0 + eta
+            beh = _behaviour(h, w_b, k, temp)
+            jac = np.ones(d) if straight_through else _gate_diag_jac(h, k, temp)
+            g = 2.0 * eta
+            if (beh - beh0) < beta:
+                g = g - penalty * (w_b * jac)
+            eta = eta - lr * g
+            n = np.linalg.norm(eta)
+            if n > budget:                       # stay within the perturbation cap
+                eta *= budget / n
+        if (_behaviour(h0 + eta, w_b, k, temp) - beh0) >= beta - 1e-2:
+            best = min(best, float(np.linalg.norm(eta)))
+    return float(best)
+
+
+def _gradfree_behaviour(h0, w_b, k, temp, beta, budget, samples=3000, seed=0):
+    """Gradient-free confirmation: search directions, line-search the magnitude
+    that first satisfies the gated behaviour target; keep the smallest ||eta||.
+    """
+    rng = np.random.default_rng(seed)
+    d = h0.shape[0]
+    beh0 = _behaviour(h0, w_b, k, temp)
+    best = budget
+    for i in range(samples):
+        v = w_b + 0.5 * rng.standard_normal(d) if i % 2 == 0 else rng.standard_normal(d)
+        v = v / (np.linalg.norm(v) + 1e-12)
+        for c in np.linspace(0.05, budget, 60):
+            if (_behaviour(h0 + c * v, w_b, k, temp) - beh0) >= beta:
+                best = min(best, float(c)); break
+    return float(best)
+
+
+def masking_demo(W: np.ndarray, w_b: np.ndarray, U: np.ndarray | None = None,
+                 k: int | None = None, temp: float = 0.02, beta: float = 1.0,
+                 budget: float = 20.0, V: float = 3.0, seed: int = 0) -> MaskingResult:
+    """Run the four behaviour-raising attackers on one planted pair.
+
+    Controlled read-position scenario (validates the detection machinery): the
+    behaviour direction is concentrated on the few coordinates where |w_b| is
+    largest, and the top-k gate slots are filled by DISTRACTOR coordinates that
+    carry ~no behaviour weight. The behaviour coordinates start gated OFF (below
+    threshold), so raising the behaviour requires pushing them across the gate's
+    cliff. The honest gradient there is ~0 (masked), so the naive attacker
+    stalls at the budget cap ("looks safe"); BPDA and the gradient-free search
+    push through and recover the true, small perturbation. ``U`` is accepted for
+    interface symmetry but unused (behaviour-only probe).
+    """
+    d = W.shape[0]
+    if k is None:
+        k = max(2, d // 4)
+    m = max(1, d // 8)
+    order = np.argsort(np.abs(w_b))          # ascending |w_b|
+    beh_coords = order[-m:]                   # concentrate behaviour on largest |w_b|
+    dist_coords = order[:k]                   # distractors: smallest |w_b| (~0 weight)
+    w_hat = np.zeros(d)
+    w_hat[beh_coords] = w_b[beh_coords]
+    nrm = np.linalg.norm(w_hat)
+    w_hat = w_hat / nrm if nrm > 1e-12 else w_b / np.linalg.norm(w_b)
+    h0 = np.zeros(d)
+    h0[dist_coords] = V                       # distractors ON -> threshold ~ V
+    # behaviour coords remain at 0 -> gated off
+
+    S_nogate = float(beta / max(np.linalg.norm(w_hat), 1e-12))
+    S_naive = _pgd_behaviour(h0, w_hat, k, temp, beta, False, budget, seed=seed)
+    S_bpda = _pgd_behaviour(h0, w_hat, k, temp, beta, True, budget, seed=seed)
+    S_gf = _gradfree_behaviour(h0, w_hat, k, temp, beta, budget, seed=seed)
+    return MaskingResult(S_nogate=S_nogate, S_naive=S_naive, S_bpda=S_bpda,
+                         S_gradfree=S_gf, budget=budget)
+
+
+__all__ += ["MaskingResult", "soft_top_k", "masking_demo"]

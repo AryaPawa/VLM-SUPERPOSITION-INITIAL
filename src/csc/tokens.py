@@ -2,48 +2,45 @@
 csc.tokens
 ==========
 
-The token-aggregation substrate (R3 -> R4 bridge). This is the honest version of
-the compression axis: instead of tying N to d_eff by fiat, we build *N carrier
-tokens*, pool them into the read position the monitor consumes, and then MEASURE
-the read-position pressure rho_rd that results. The claim "compressing tokens
-raises read-position superposition" (N -> rho_rd) becomes an empirical output of
-the construction rather than an assumption.
+The token-aggregation substrate (R3 -> R4 bridge), **Variant B**.
 
-Mechanism (faithful to a pooled VLM read-out)
----------------------------------------------
-Each of the N tokens contributes ``k_per_token`` independent read directions in
-the d_eff-dimensional read space. The pooled read subspace is the span of all of
-them, so its rank is
+Goal: an honest compression axis where reducing the token budget N raises
+read-position pressure rho_rd *and* lowers safety S, with the correct sign.
 
-    r_pool = min(N * k_per_token, d_eff).
+Why not shrink the read subspace (Variant A -- rejected)
+--------------------------------------------------------
+The tempting design is "fewer tokens -> lower-rank pooled read subspace"
+(r_pool = min(N*k, d_eff)). It has a fatal confound: the safety monitor is a
+FIXED rank-r subspace. Once r_pool falls to <= r, the monitor covers the entire
+feature subspace, the evasion gain Gamma_r collapses to 0, and S -> infinity --
+so heavy compression looks *infinitely safe*. That inverts the relationship for
+a substrate reason, not a real one. (Observed: at small N the monitor over-covers
+the tiny subspace and every attack is infeasible.)
 
-The F latent features are written into this pooled subspace (coordinates C in
-R^{r_pool}), so the read dictionary is
+Variant B (this module)
+-----------------------
+Keep the read width d_eff FIXED (so the rank-r monitor always covers the same
+fraction r/d_eff -> Gamma_r stays steady). Model compression by MERGING MORE
+FEATURES into that fixed-width read as tokens are removed:
 
-    W_rd = Q @ C          Q in R^{d_eff x r_pool} orthonormal (the pooled basis)
+    F_rd(N) = round(F_ref * N_ref / N)         (capped for tractability)
 
-Fewer tokens -> smaller r_pool -> the same F features are forced into fewer
-effective read dimensions -> coherence rises toward the Welch floor for load
-F / r_pool, the measured d_eff falls, and rho_rd = F_eff / d_eff rises. The
-behaviour leverage ||a|| = ||W_rd^T w_b|| then grows and the minimal evading
-perturbation S falls -- exactly the chain, now driven by the token budget N.
+Fewer tokens -> more features share the same d_eff directions -> coherence up,
+behaviour leverage ||a|| = ||W^T w_b|| up, while Gamma_r is held ~constant by the
+fixed monitor coverage -> S = beta / (Gamma_r * ||a||) falls monotonically. This
+is the faithful "pooling merges features into a fixed read" picture, and it
+reuses the validated exact-geometry frame (unit columns in R^{d_eff}); the only
+token-specific ingredient is the compression->load map F_rd(N).
 
-Block vs read pressure (review split)
--------------------------------------
-    rho_blk = F / (N * k_per_token)     # pressure across the whole token block
-    rho_rd  = F_eff / d_eff (measured)  # pressure at the read position
+    rho_blk = F_rd / (N * k_per_token)     # block-level pressure
+    rho_rd  = F_eff / d_eff (measured)     # read pressure ~ F_rd / d_eff
 
-The N -> rho_rd arrow is the empirical aggregation claim; this module is where we
-get to watch it happen in a setting where everything is still exact.
-
-The output W_rd is an ordinary (d_eff x F) unit-column dictionary, so every
-downstream tool (plant_pair, delta_star_analytic, the estimators, the gate)
-consumes it unchanged.
+The output W is an ordinary (d_eff x F_rd) unit-column dictionary, consumed
+unchanged by plant_pair, delta_star_analytic, the estimators, and the gate.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 
@@ -54,54 +51,41 @@ __all__ = ["TokenParams", "build_token_dictionary", "TokenBuild"]
 
 @dataclass
 class TokenParams:
-    F: int = 128            # number of latent features to encode
-    N: int = 32             # number of carrier tokens (the compression axis)
-    d_eff: int = 32         # read-position dimension the monitor consumes (fixed)
-    k_per_token: int = 2    # independent read directions each token contributes
+    F_ref: int = 32         # features merged into the read at the reference budget
+    N: int = 32             # carrier-token budget (the compression axis)
+    N_ref: int = 32         # reference (uncompressed) token budget
+    d_eff: int = 32         # FIXED read-position width the monitor consumes
+    k_per_token: int = 1    # features-worth each token carries (for rho_blk only)
+    max_load: float = 24.0  # cap F_rd / d_eff so the frame stays tractable
     seed: int = 0
 
-    def r_pool(self) -> int:
-        """Rank of the pooled read subspace = min(N * k_per_token, d_eff)."""
-        return int(min(self.N * self.k_per_token, self.d_eff))
+    def F_rd(self) -> int:
+        """Effective read features = F_ref * N_ref / N (fewer tokens -> more)."""
+        raw = int(round(self.F_ref * self.N_ref / max(self.N, 1)))
+        cap = int(self.max_load * self.d_eff)
+        return int(max(1, min(raw, cap)))
 
     def rho_blk(self) -> float:
-        """Block-level pressure across the whole token budget."""
-        return float(self.F / max(self.N * self.k_per_token, 1))
+        return float(self.F_rd() / max(self.N * self.k_per_token, 1))
 
 
 @dataclass
 class TokenBuild:
-    W: np.ndarray           # (d_eff, F) unit-column read dictionary
-    r_pool: int             # rank of the pooled read subspace
-    rho_blk: float          # F / (N * k_per_token)
-    Q: np.ndarray           # (d_eff, r_pool) orthonormal pooled basis
+    W: np.ndarray           # (d_eff, F_rd) unit-column read dictionary
+    F_rd: int               # effective number of read features at this N
+    rho_blk: float          # block-level pressure
+    d_eff: int              # fixed read width (== packing dimension)
 
 
 def build_token_dictionary(p: TokenParams) -> TokenBuild:
-    """Construct the pooled read dictionary for a token budget N.
+    """Fixed-width read frame with F_rd(N) features merged into it.
 
-    Steps
-    -----
-    1. Each token n gets a random block B_n in R^{d_eff x k_per_token}.
-    2. Stack the N blocks and orthonormalise -> pooled basis Q of rank r_pool
-       (this is the "mean/attention pool collapses N tokens into a rank-limited
-       read" step; rank is capped at d_eff).
-    3. Draw feature coordinates C in R^{r_pool x F} and map to read space via Q.
-    4. Unit-normalise the columns -> W_rd.
+    W is a generic exact-geometry frame (unit Gaussian columns) in the FIXED
+    d_eff read space; the token/compression content is entirely in how many
+    features F_rd(N) are packed in. This keeps the monitor coverage fraction
+    fixed (steady Gamma_r) so the leverage channel drives S with the right sign.
     """
     rng = np.random.default_rng(p.seed)
-    k = max(1, p.k_per_token)
-
-    # (1) per-token read blocks, then (2) pool -> orthonormal basis of rank r_pool
-    B = rng.standard_normal((p.d_eff, p.N * k))
-    # economy QR gives an orthonormal basis for the column span; its rank is
-    # min(d_eff, N*k) = r_pool. Take the first r_pool columns.
-    Q_full, _ = np.linalg.qr(B)
-    r_pool = p.r_pool()
-    Q = Q_full[:, :r_pool]
-
-    # (3) features live in the pooled subspace; (4) normalise columns
-    C = rng.standard_normal((r_pool, p.F))
-    W = Q @ C
-    W = est.normalize_columns(W)
-    return TokenBuild(W=W, r_pool=r_pool, rho_blk=p.rho_blk(), Q=Q)
+    F = p.F_rd()
+    W = est.normalize_columns(rng.standard_normal((p.d_eff, F)))
+    return TokenBuild(W=W, F_rd=F, rho_blk=p.rho_blk(), d_eff=p.d_eff)

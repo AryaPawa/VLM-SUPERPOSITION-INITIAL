@@ -139,3 +139,73 @@ def aggregate_cells(df: pd.DataFrame) -> pd.DataFrame:
     ).groupby("cell")["inf"].mean()
     agg["infeasible_frac"] = infeasible_frac
     return agg.reset_index()
+
+
+# --------------------------------------------------------------------------- #
+# Token-substrate N-sweep: the honest N -> rho_rd -> S bridge.
+# --------------------------------------------------------------------------- #
+def token_sweep(
+    F_ref: int = 32,
+    d_eff: int = 32,
+    N_ref: int = 32,        # reference (uncompressed) token budget; F_rd(N_ref)=F_ref
+    k_per_token: int = 1,
+    N_values: Sequence[int] = (2, 4, 8, 16, 24, 32),
+    s: float = 0.05,
+    monitor_rank: int = 4,
+    monitor_angle_deg: float = 30.0,
+    n_pairs: int = 40,
+    beta: float = 1.0,
+    tau: float = 0.0,
+    seed: int = 0,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Vary the token budget N at FIXED d_eff (Variant B); measure how compression
+    drives read pressure and safety. One row per planted pair.
+
+    Compression axis (Variant B): N down => more features merged into the fixed
+    read, F_rd = round(F_ref * N_ref / N) up => rho_rd ~ F_rd/d_eff up, coherence
+    up, leverage ||a|| up, while the fixed-width monitor keeps Gamma_r steady =>
+    S = beta/(Gamma_r*||a||) down. (Contrast Variant A, which shrank the subspace
+    and inverted the sign once the monitor over-covered it.)
+    """
+    rows = []
+    for N in N_values:
+        cfg = ToyConfig(
+            F=F_ref, d_eff=d_eff, N=N, N0=N_ref, k_per_token=k_per_token, s=s,
+            geometry="token", monitor_rank=monitor_rank,
+            monitor_angle_deg=monitor_angle_deg, seed=seed + N,
+        )
+        model = ToyModel(cfg)
+        F_rd = model.F                          # effective read features at this N
+        coh = model.coherence()
+        wf = model.welch_floor()                # welch_floor(F_rd, d_eff)
+        acts = model.read_activations(2000)
+        feats = model.sample_features(2000)
+        d_eff_meas = est.d_eff(acts)
+        f_eff_meas = est.f_eff(feats, floor=1e-4)
+        rho = est.rho_rd(f_eff_meas, d_eff_meas)
+
+        pair_rng = np.random.default_rng(seed + N + 7)
+        for p in range(n_pairs):
+            _, w_b, U = model.plant_pair(pair_rng)
+            res = delta_star_analytic(model.W, w_b, U, beta=beta, tau=tau)
+            rows.append(dict(
+                N=N, k_per_token=k_per_token, F_rd=F_rd, d_eff=d_eff,
+                load=F_rd / d_eff, rho_blk=model.rho_blk,
+                coherence=coh, welch_floor=wf,
+                d_eff_meas=d_eff_meas, f_eff_meas=f_eff_meas, rho_rd=rho,
+                pair=p, gamma_r=res.gamma_r, leverage=res.leverage,
+                log_alignment=est.log_alignment(res.gamma_r),
+                S=res.delta_input, feasible=res.feasible,
+            ))
+        if verbose:
+            import numpy as _np
+            svals = [r["S"] for r in rows if r["N"] == N and _np.isfinite(r["S"])]
+            med = _np.nanmedian(svals) if svals else float("nan")
+            print(f"  N={N:3d}  F_rd={F_rd:4d}  load={F_rd/d_eff:5.1f}  "
+                  f"coh={coh:.3f}  d_eff_meas={d_eff_meas:5.1f}  rho_rd={rho:6.2f}  "
+                  f"medianS={med:.3f}")
+    return pd.DataFrame(rows)
+
+
+__all__ += ["token_sweep"]
