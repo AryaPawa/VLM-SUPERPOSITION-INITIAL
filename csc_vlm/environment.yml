@@ -1,0 +1,11 @@
+name: csc_vlm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt
+# GPU deps (torch + transformers + bitsandbytes + datasets) are installed
+# separately AFTER creating this env, so torch can match the cluster's CUDA.
+# See README.md "Setup on the cluster".

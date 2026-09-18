@@ -1,0 +1,9 @@
+# GPU extras for the real-model runs.
+# IMPORTANT: install torch FIRST, matching the cluster's CUDA (see README),
+# then `pip install -r requirements-gpu.txt`.
+transformers>=4.49.0      # Qwen2.5-VL requires >=4.49
+accelerate>=0.34.0
+bitsandbytes>=0.44.0      # only needed for --load-4bit (Linux/CUDA)
+datasets>=2.19.0          # dataset auto-download
+qwen-vl-utils>=0.0.8      # helps Qwen2.5-VL image processing (harmless for LLaVA)
+sentencepiece>=0.2.0
