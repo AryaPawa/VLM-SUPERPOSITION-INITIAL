@@ -50,10 +50,13 @@ def _ckpt_paths(outdir: str):
             os.path.join(outdir, "monitor.npz"))
 
 
+CKPT_VERSION = "0.4.0"
+
+
 def _save_checkpoint(path, cfg, dataset, n_deltas, steps, seed, calib, rows):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"version": "0.3.0", "config": dataclasses.asdict(cfg),
+        json.dump({"version": CKPT_VERSION, "config": dataclasses.asdict(cfg),
                    "dataset": dataset, "n_deltas": n_deltas, "steps": steps,
                    "seed": seed, "calib": calib, "rows": rows}, f, indent=2)
     os.replace(tmp, path)                      # atomic: never leaves a half-written file
@@ -94,31 +97,60 @@ def self_check(cfg: VLMConfig, dataset: str = "synthetic", seed: int = 0) -> boo
 
 
 # ------------------------------------------------------------------ figure #
-def _figure(rows: List[Dict], outpath: str, model: str):
+def _figure(rows: List[Dict], sweep: List[Dict], outpath: str, model: str):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(12, 9))
     fig.suptitle(f"Compression-safety frontier ({model})", fontsize=12, fontweight="bold")
+
+    # operating points (PID delta-frontier)
     d = np.array([r["delta"] for r in rows]); comp = np.array([r["compression"] for r in rows])
     S = np.array([r["S"] for r in rows]); lam = np.array([r["lam"] for r in rows])
-    lev = np.array([r["leverage"] for r in rows]); gam = np.array([r["gamma_r"] for r in rows])
-    deff = np.array([r["d_eff"] for r in rows])
-    o = np.argsort(S)
-    ax[0, 0].plot(S[o], comp[o], "o-", color="#1f77b4")
-    ax[0, 0].set_xlabel("achieved safety S"); ax[0, 0].set_ylabel("compression 1/keep")
-    ax[0, 0].set_title("(a) frontier: safety costs compression"); ax[0, 0].grid(alpha=0.3)
+
+    # full-range descriptive sweep (robust curve)
+    if sweep:
+        sc = np.array([s["compression"] for s in sweep])
+        sS = np.array([s["S"] for s in sweep]); sSr = np.array([s["S_refit"] for s in sweep])
+        sgam = np.array([s["gamma_r"] for s in sweep]); sgamR = np.array([s["gamma_refit"] for s in sweep])
+        slev = np.array([s["leverage"] for s in sweep]); sdeff = np.array([s["d_eff"] for s in sweep])
+    else:
+        sc = comp; sS = S; sSr = np.array([r.get("S_refit", np.nan) for r in rows])
+        sgam = np.array([r["gamma_r"] for r in rows]); sgamR = np.array([r.get("gamma_refit", np.nan) for r in rows])
+        slev = np.array([r["leverage"] for r in rows]); sdeff = np.array([r["d_eff"] for r in rows])
+
+    # (a) full-range frontier: safety vs compression, with operating points
+    a = ax[0, 0]
+    a.plot(sS, sc, "-", color="#1f77b4", alpha=0.6, label="full keep sweep")
+    a.plot(S, comp, "o", color="#d62728", label="δ operating points")
+    a.set_xlabel("achieved safety S (log)"); a.set_ylabel("compression 1/keep (log)")
+    a.set_xscale("log"); a.set_yscale("log")
+    a.set_title("(a) frontier: safety costs compression")
+    a.grid(alpha=0.3, which="both"); a.legend(fontsize=8)
+
+    # (b) price of safety
     ax[0, 1].plot(d, lam, "s-", color="#2ca02c")
     ax[0, 1].set_xlabel("safety floor δ"); ax[0, 1].set_ylabel("shadow price λ")
     ax[0, 1].set_title("(b) price of safety"); ax[0, 1].grid(alpha=0.3)
-    c = ax[1, 0]; c.plot(comp, lev, "o-", color="#d62728", label="‖a‖")
-    c2 = c.twinx(); c2.plot(comp, gam, "^--", color="#7f7f7f", label="Γ_r")
-    c.set_xlabel("compression 1/keep"); c.set_ylabel("‖a‖", color="#d62728")
-    c2.set_ylabel("Γ_r", color="#7f7f7f")
-    c.set_title("(c) mediators vs compression (H3)"); c.grid(alpha=0.3)
-    ax[1, 1].plot(comp, deff, "o-", color="#9467bd")
-    ax[1, 1].set_xlabel("compression 1/keep"); ax[1, 1].set_ylabel("read dim d_eff")
-    ax[1, 1].set_title("(d) read dimensionality vs compression"); ax[1, 1].grid(alpha=0.3)
+
+    # (c) mediators over the FULL sweep: Gamma_r (primary) + leverage (secondary)
+    oc = np.argsort(sc)
+    c = ax[1, 0]
+    c.plot(sc[oc], sgam[oc], "^-", color="#1f77b4", label="Γ_r (escape, primary)")
+    c2 = c.twinx(); c2.plot(sc[oc], slev[oc], "o--", color="#d62728", alpha=0.7, label="‖a‖ (secondary)")
+    c.set_xlabel("compression 1/keep (log)"); c.set_xscale("log")
+    c.set_ylabel("Γ_r", color="#1f77b4"); c2.set_ylabel("‖a‖", color="#d62728")
+    c.set_title("(c) mediator vs compression — Γ_r carries it"); c.grid(alpha=0.3, which="both")
+
+    # (d) staleness control: frozen vs refit safety over the sweep
+    dax = ax[1, 1]
+    dax.plot(sc[oc], sS[oc], "o-", color="#1f77b4", label="S (frozen monitor)")
+    dax.plot(sc[oc], sSr[oc], "s--", color="#ff7f0e", label="S (refit monitor)")
+    dax.set_xlabel("compression 1/keep (log)"); dax.set_xscale("log")
+    dax.set_yscale("log")
+    dax.set_ylabel("safety S (log)"); dax.set_title("(d) staleness control: frozen vs refit")
+    dax.grid(alpha=0.3, which="both"); dax.legend(fontsize=8)
+
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(outpath, dpi=130); plt.close(fig)
 
@@ -136,12 +168,21 @@ def run_frontier(cfg: VLMConfig, dataset: str, outdir: str, resume: bool = False
     if resume and os.path.exists(ck_path) and os.path.exists(mon_path):
         with open(ck_path) as f:
             ck = json.load(f)
-        if ck["config"].get("model") != cfg.model:
+        ck_ver = str(ck.get("version", "0"))
+        if not ck_ver.startswith("0.4"):
+            # an older-format checkpoint has a different calibration schema (no
+            # full-range sweep / warm starts). Resuming it would mix schemes, so we
+            # start fresh rather than silently degrade. Use a new --out to keep old
+            # results.
+            print(f"[resume] checkpoint is v{ck_ver}, incompatible with v{CKPT_VERSION}; "
+                  f"starting fresh (use a new --out to keep the old run).")
+        elif ck["config"].get("model") != cfg.model:
             raise ValueError(f"checkpoint model {ck['config'].get('model')} != {cfg.model}; "
-                             f"use a fresh --outdir")
-        rows = ck["rows"]; calib = ck["calib"]
-        mon = np.load(mon_path); w_b, U = mon["w_b"], mon["U"]
-        print(f"[resume] loaded {len(rows)} completed δ from {ck_path}")
+                             f"use a fresh --out")
+        else:
+            rows = ck["rows"]; calib = ck["calib"]
+            mon = np.load(mon_path); w_b, U = mon["w_b"], mon["U"]
+            print(f"[resume] loaded {len(rows)} completed δ from {ck_path}")
 
     backend, _, _ = _build_backend(cfg, dataset, per_class=per_class, seed=seed)
 
@@ -163,27 +204,40 @@ def run_frontier(cfg: VLMConfig, dataset: str, outdir: str, resume: bool = False
     restore_calibration(oracle, calib)
 
     deltas = calib["deltas"]
+    warm = calib.get("warm", [None] * len(deltas))
     done = {round(r["delta"], 6) for r in rows}
     for i, delta in enumerate(deltas):
         if round(float(delta), 6) in done:
             continue
-        r = pid_solve(oracle, float(delta), cfg, steps=steps, seed=seed + 100 * i)
+        # keep_lo/keep_hi left to pid_solve's tight local bracket around the warm
+        # start (inverse-curve solution) -- see solver.pid_solve.
+        r = pid_solve(oracle, float(delta), cfg,
+                      keep_start=(warm[i] if i < len(warm) else None),
+                      steps=steps, seed=seed + 100 * i)
         rows.append(r)
         _save_checkpoint(ck_path, cfg, dataset, n_deltas, steps, seed, calib, rows)
         flag = " (bound)" if r["at_bound"] else ""
         print(f"  δ={delta:6.3f} -> keep={r['keep']:.3f} comp={r['compression']:5.2f}x "
-              f"S={r['S']:.3f} λ={r['lam']:.3f} Γ={r['gamma_r']:.3f} "
+              f"S={r['S']:.3f} S_refit={r['S_refit']:.3f} λ={r['lam']:.3f} "
+              f"Γ={r['gamma_r']:.3f} Γ_refit={r['gamma_refit']:.3f} "
               f"‖a‖={r['leverage']:.3f} d_eff={r['d_eff']:.1f}{flag}  [saved]")
 
     rows = sorted(rows, key=lambda r: r["delta"])
     import pandas as pd
-    keys = ("delta", "keep", "compression", "S", "S_geom", "lam",
-            "gamma_r", "leverage", "d_eff", "at_bound")
-    pd.DataFrame([{k: r[k] for k in keys} for r in rows]).to_csv(
+    keys = ("delta", "keep", "compression", "S", "S_sigma", "S_refit", "S_geom",
+            "lam", "gamma_r", "gamma_refit", "A", "leverage", "d_eff", "at_bound")
+    pd.DataFrame([{k: r.get(k) for k in keys} for r in rows]).to_csv(
         os.path.join(outdir, "frontier.csv"), index=False)
-    _figure(rows, os.path.join(outdir, "figure_frontier.png"), cfg.model)
+    # descriptive full-range sweep (robust curve, incl. the near-budget cliff)
+    sweep = calib.get("sweep", [])
+    if sweep:
+        skeys = ("keep", "compression", "S", "S_sigma", "S_refit", "gamma_r",
+                 "gamma_refit", "A", "leverage", "d_eff")
+        pd.DataFrame([{k: s.get(k) for k in skeys} for s in sweep]).to_csv(
+            os.path.join(outdir, "sweep.csv"), index=False)
+    _figure(rows, sweep, os.path.join(outdir, "figure_frontier.png"), cfg.model)
 
-    ev = evaluate_frontier(rows)
+    ev = evaluate_frontier(rows, S_ref=float(calib.get("S_ref", 1.0)))
     print("\n=== G-VLM (frontier) ===")
     for k, v in ev["checks"].items():
         print(f"  [{'PASS' if v else 'FAIL'}]  {k}")
@@ -192,6 +246,7 @@ def run_frontier(cfg: VLMConfig, dataset: str, outdir: str, resume: bool = False
     print(f"  VERDICT: {'PASSED' if ev['passed'] else 'FAILED'}  "
           f"(model evals: {oracle.evals})")
     print(f"[out] {os.path.join(outdir, 'frontier.csv')}")
+    print(f"[out] {os.path.join(outdir, 'sweep.csv')}")
     print(f"[out] {os.path.join(outdir, 'figure_frontier.png')}")
     with open(os.path.join(outdir, "verdict.json"), "w") as f:
         json.dump(ev, f, indent=2)

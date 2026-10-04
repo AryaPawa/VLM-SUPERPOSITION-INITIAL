@@ -23,14 +23,23 @@ For each run directory (`--out`):
 
 | file | contents |
 |---|---|
-| `frontier.csv` | one row per δ: `keep, compression, S, λ, Γ_r, ‖a‖, d_eff, …` |
-| `figure_frontier.png` | 4 panels: frontier, shadow price, H3 mediators, read-dim |
+| `sweep.csv` | the **robust descriptive curve**: one row per keep over the *whole* compression range — `keep, compression, S, S_sigma, S_refit, Γ_r, Γ_refit, A, ‖a‖, d_eff`. This is pure measurement (no optimiser), so it always traces a clean curve, including the near-full-budget cliff. |
+| `frontier.csv` | the δ-sweep operating points (the constrained-optimisation frontier): `delta, keep, compression, S, S_sigma, S_refit, S_geom, λ, Γ_r, Γ_refit, A, ‖a‖, d_eff, at_bound` |
+| `figure_frontier.png` | 4 panels: (a) full-range frontier + δ points, (b) shadow price λ, (c) mediator Γ_r vs compression (‖a‖ secondary), (d) **frozen-vs-refit** safety (the staleness control) |
 | `verdict.json` | the three gate results + summary statistics |
 | `checkpoint.json`, `monitor.npz` | resume state (safe to keep) |
 
 The scientific verdict has three gates: **frontier_monotone** (more safety ⇒ less
-compression), **mechanism_H3** (leverage rises with compression — the causal story),
-and **feasible** (each point meets its floor within measurement noise).
+compression), **mechanism_H3** (the escape fraction **Γ_r rises with compression** —
+the real-VLM mediator; see §9), and **feasible** (each point meets its floor within
+measurement noise, with the tolerance scaled to the model's own S scale).
+
+**Reading the staleness control (panel d / `S_refit`):** the monitor is fit once on
+uncompressed activations and held fixed (the persistence setting). `S_refit` re-fits a
+monitor on the compressed activations. If `S_refit` also falls with compression, the
+erosion is intrinsic (superposition). If `S_refit` stays high while only the frozen `S`
+falls, a large part of the effect is monitor staleness. `staleness_median_S_refit/S_frozen`
+in `verdict.json` summarises this.
 
 ---
 
@@ -89,14 +98,25 @@ sbatch scripts/run_qwen.slurm
 sbatch scripts/run_llava.slurm
 ```
 
-…or run directly on a GPU node:
+…or run directly on a GPU node. The **four cells** (2 lineages × 2 concepts) with the
+recommended knobs:
 
 ```bash
-python run.py --model qwen  --dataset hf:microsoft/cats_vs_dogs --out runs/qwen
-python run.py --model llava --dataset hf:microsoft/cats_vs_dogs --out runs/llava
+# benign concept (cats-vs-dogs)
+python run.py --model llava --dataset hf:microsoft/cats_vs_dogs --out runs/llava_v4        --n-pairs 40 --steps 40 --n-deltas 6
+python run.py --model qwen  --dataset hf:microsoft/cats_vs_dogs --out runs/qwen_v4         --n-pairs 40 --steps 40 --n-deltas 6
+# safety-facing concept (COCO person; build it once first, see §5)
+python run.py --model llava --dataset coco_person              --out runs/llava_person_v4 --n-pairs 40 --steps 40 --n-deltas 6
+python run.py --model qwen  --dataset coco_person              --out runs/qwen_person_v4  --n-pairs 40 --steps 40 --n-deltas 6
 ```
 
-Each run is roughly **1–3 h on one H100** (7B, `--n-pairs 24 --steps 60 --n-deltas 6`).
+Each cell is roughly **3–5 h on one H100** (7B, `--n-pairs 40 --steps 40 --n-deltas 6`);
+all four ≈ **15–20 H100-h**. Bump `--n-pairs 48` and/or `--n-deltas 8` for sharper
+curves (still ≲ 30 h).
+
+> **Use a fresh `--out` for v0.4 runs** (the `_v4` suffix above). v0.4 changed the
+> calibration schema; it will **not** resume a pre-v0.4 checkpoint (it detects the
+> version and starts fresh with a clear message, leaving the old run untouched).
 
 ### Resuming after a pre-emption
 
@@ -105,7 +125,7 @@ monitor and calibration and skips δ points already in `checkpoint.json`, so a r
 costs at most one δ of work:
 
 ```bash
-python run.py --model qwen --dataset hf:microsoft/cats_vs_dogs --out runs/qwen --resume
+python run.py --model qwen --dataset hf:microsoft/cats_vs_dogs --out runs/qwen_v4 --resume --n-pairs 40 --steps 40 --n-deltas 6
 ```
 
 ---
@@ -163,15 +183,15 @@ A few hundred images per class is plenty (`--per-class`).
 | `--dataset` | `hf:microsoft/cats_vs_dogs` | see §5 |
 | `--load-4bit` | off | 4-bit quant (fits 7B on a small GPU; H100 can skip it) |
 | `--read-layer-frac` | 0.70 | decoder depth for the monitor read position |
-| `--n-pairs` | 24 | images per safety evaluation (↑ = less noise, more compute) |
-| `--n-deltas` | 6 | number of frontier points |
-| `--steps` | 60 | PID iterations per δ |
+| `--n-pairs` | 24 (**use 40**) | images per safety evaluation (↑ = less noise, more compute) |
+| `--n-deltas` | 6 | number of δ operating points on the frontier |
+| `--steps` | 60 (**use 40**) | PID iterations per δ (warm-started, so 40 is plenty) |
 | `--per-class` | 200 | images per class to load |
-| `--resume` | off | continue from `--out` checkpoint |
+| `--resume` | off | continue from `--out` checkpoint (same-version only) |
 
-If `feasible` fails with a small `median|S-δ|`, that is sampling noise near the
-boundary, not a mechanism failure — raise `--n-pairs` to 32–48. The load-bearing
-scientific results are `frontier_monotone` and `mechanism_H3`.
+The full-range `sweep.csv` is the load-bearing descriptive result and cannot
+degenerate. If `feasible` fails with a small `median|S-δ|`, that is sampling noise near
+the boundary, not a mechanism failure — raise `--n-pairs` to 48.
 
 ---
 
@@ -195,7 +215,8 @@ run.py                     CLI entry point
 csc_vlm/
   geometry.py              monitor fit + obfuscation cost S = β/(Γ_r·‖a‖)
   backends.py              mock + HF (LLaVA/Qwen) backends, visual-token merge
-  solver.py                safety oracle, calibration, PID-Lagrangian, evaluation
+  solver.py                oracle, full-range keep-sweep, per-model calibration,
+                           PID-Lagrangian solve (+ feasibility restoration), evaluation
   data.py                  dataset resolver (hf / folder / synthetic)
   runner.py                checkpointed orchestration + figure + verdict
 scripts/
@@ -207,3 +228,35 @@ environment.yml            blank conda env (CPU core)
 requirements.txt           CPU core deps
 requirements-gpu.txt       transformers / datasets / bitsandbytes (torch separate)
 ```
+
+---
+
+## 9. What changed in v0.4 (and why)
+
+After the first real-GPU runs, four things were fixed. The module boundaries are
+unchanged — all edits live in `geometry.py`, `solver.py`, `runner.py`.
+
+1. **Full-range keep sweep** (`solver.sweep_keep`). The frontier is now built on a
+   direct measurement across the whole keep range (`sweep.csv`), which captures the
+   Γ_r cliff near full budget and cannot degenerate. The δ-operating-point frontier is
+   kept as the T-BALANCE illustration.
+2. **Per-model calibration** (`solver.calibrate`). δ targets are read off the measured
+   curve at interior keeps and each PID solve is warm-started at the inverse-curve keep
+   (where S≈δ). This fixes the earlier collapse where a model whose safety saturated at
+   high compression pinned every δ at the box with λ at its cap.
+3. **Mediator = Γ_r** (`solver.evaluate_frontier`, `geometry.log_alignment`). On real
+   VLMs the token-merge averaging shrinks the covariance, so leverage ‖a‖ *falls* with
+   compression while the escape fraction **Γ_r rises** and carries the effect. The
+   mechanism gate tests Γ_r (and reports `A = −log(1−Γ_r²)`); leverage is reported as
+   secondary. A finding, not a bug: leverage decreasing under merge compression is real.
+4. **Frozen-vs-refit monitor control** (`geometry.geometry_frozen_and_refit`). Nearly
+   free, and it separates genuine superposition erosion from monitor staleness (panel d).
+
+Plus: feasibility tolerance is scaled to each model's S scale (no fixed absolute
+floor), the PID adds a short feasibility-restoration step so every operating point
+genuinely meets its floor, and the checkpoint is versioned (`0.4.0`) so an old run is
+never silently resumed under the new schema.
+
+Validation: `python run.py --model mock` passes monotone + feasible end-to-end, and a
+synthetic oracle reproducing the saturated-safety failure mode now traces a clean
+frontier instead of collapsing.

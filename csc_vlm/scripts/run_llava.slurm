@@ -14,11 +14,11 @@ mkdir -p logs
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate csc_vlm
 
-OUT=runs/llava
+OUT=runs/llava_v4
 
 srun python run.py \
     --model llava \
     --dataset hf:microsoft/cats_vs_dogs \
     --out "$OUT" \
     --resume \
-    --n-pairs 24 --n-deltas 6 --steps 60 --per-class 200
+    --n-pairs 40 --n-deltas 6 --steps 40 --per-class 200

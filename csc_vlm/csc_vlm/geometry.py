@@ -23,7 +23,15 @@ from typing import Dict, Tuple
 import numpy as np
 
 __all__ = ["normalize_columns", "d_eff", "cov_half", "fit_monitor",
-           "measured_geometry"]
+           "measured_geometry", "log_alignment", "geometry_frozen_and_refit"]
+
+
+def log_alignment(gamma_r: float) -> float:
+    """A = -log(1 - Gamma_r^2): the review's log-alignment scale. Spreads the
+    informative region of Gamma_r (which lives near the ceiling for a rank-r
+    monitor) across the real line so it can mediate. Larger A == more escape."""
+    g2 = float(np.clip(gamma_r, 0.0, 1.0)) ** 2
+    return float(-np.log(max(1.0 - g2, 1e-12)))
 
 
 # ------------------------------------------------------------------ estimators #
@@ -97,4 +105,32 @@ def measured_geometry(H: np.ndarray, w_b: np.ndarray, U: np.ndarray,
     gamma = float(escn / (lev + 1e-12))
     obf = float(beta / max(escn, 1e-9))
     return {"leverage": lev, "gamma_r": gamma, "d_eff": float(d_eff(H)),
-            "obf_cost": obf}
+            "obf_cost": obf, "escape_norm": escn, "log_alignment": log_alignment(gamma)}
+
+
+def geometry_frozen_and_refit(H: np.ndarray, y: np.ndarray, w_b: np.ndarray,
+                              U: np.ndarray, rank: int, beta: float = 1.0,
+                              shrink: float = 0.2) -> Tuple[Dict[str, float],
+                                                            Dict[str, float]]:
+    """Measure the read geometry two ways on the SAME compressed activations:
+
+      * frozen  -- against the monitor (w_b, U) fit once on uncompressed data.
+                   This is the persistence setting: safety erodes as the geometry
+                   drifts away from the monitor we committed to.
+      * refit   -- against a monitor re-fit on THESE activations. This is the
+                   staleness control: if S_refit also collapses with compression,
+                   the erosion is intrinsic (superposition); if S_refit stays high
+                   while only S_frozen falls, the effect is mostly monitor
+                   staleness / distribution shift, not feature packing.
+
+    The refit is pure linear algebra on activations already collected, so it is
+    nearly free relative to the model forward passes.
+    """
+    g_frozen = measured_geometry(H, w_b, U, beta, shrink)
+    y = np.asarray(y)
+    if set(np.unique(y).tolist()) >= {0, 1}:
+        w_b2, U2 = fit_monitor(H, y, rank)
+        g_refit = measured_geometry(H, w_b2, U2, beta, shrink)
+    else:                                   # degenerate labels -> refit == frozen
+        g_refit = dict(g_frozen)
+    return g_frozen, g_refit
