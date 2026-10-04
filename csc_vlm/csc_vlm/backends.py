@@ -8,11 +8,18 @@ at a given visual-token keep ratio; everything downstream is model-agnostic.
 * MockVLMBackend -- synthetic Variant-B geometry, CPU, no torch. Validates logic.
 * HFVLMBackend   -- real LLaVA-1.5 / Qwen2.5-VL via transformers (lazy import).
                     Verified on Qwen2.5-VL-3B: model loads, hook fires, activations
-                    extracted. Compression merges ONLY the visual-token span.
+                    extracted. Compression merges OR prunes ONLY the visual-token span.
+
+Compression methods
+-------------------
+  "merge"  (default) : ToMe-style contiguous group-mean. Sequence length unchanged.
+  "prune"            : Activation-Magnitude Pruning via Attention-Mask Zeroing.
+                       Keeps the top-k highest-L2-norm tokens; zeros the attention
+                       mask for the rest. Sequence length unchanged -> no shape crash.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import numpy as np
@@ -39,6 +46,8 @@ class VLMConfig:
     # compression knob (keep ratio)
     keep_min: float = 0.05
     keep_max: float = 1.0
+    # compression method: "merge" | "prune"
+    compression_method: str = "merge"
     # mock-only geometry
     mock_d: int = 64
     mock_F_base: int = 48
@@ -98,6 +107,32 @@ def tome_merge_torch(x, keep_ratio, torch):
     return means[:, idx, :]
 
 
+def tome_prune_mask(span_len, keep_ratio, emb_span, torch):
+    """Activation-Magnitude Pruning: return a boolean keep mask of length span_len.
+    Tokens with the top-k highest L2 norms are kept (mask=True); the rest are pruned
+    (mask=False) by zeroing the attention mask - sequence shape is unchanged.
+
+    Args:
+        span_len  : number of visual tokens in the span (int)
+        keep_ratio: fraction of tokens to keep (float in [0,1])
+        emb_span  : [1, span_len, D] or [span_len, D] embedding tensor
+        torch     : the torch module (lazy-imported in the backend)
+
+    Returns:
+        keep_mask : 1-D bool tensor of length span_len
+    """
+    k = max(1, int(round(keep_ratio * span_len)))
+    if k >= span_len:
+        return torch.ones(span_len, dtype=torch.bool, device=emb_span.device)
+    # flatten to [T, D] if batched
+    e = emb_span.squeeze(0) if emb_span.dim() == 3 else emb_span
+    norms = e.norm(dim=-1)           # [T]
+    topk_idx = torch.topk(norms, k, largest=True, sorted=False).indices
+    mask = torch.zeros(span_len, dtype=torch.bool, device=emb_span.device)
+    mask[topk_idx] = True
+    return mask
+
+
 class HFVLMBackend(VLMBackend):
     DEFAULTS = {"llava": "llava-hf/llava-1.5-7b-hf",
                 "qwen": "Qwen/Qwen2.5-VL-7B-Instruct"}
@@ -118,10 +153,12 @@ class HFVLMBackend(VLMBackend):
         n_layers = getattr(self.model.config, "num_hidden_layers", None) or \
             self.model.config.text_config.num_hidden_layers
         self.read_layer = max(1, int(cfg.read_layer_frac * n_layers))
-        # per-forward merge state (set in collect, read by the hook)
+        # per-forward compression state (set in collect, read by the hook)
         self._merge_keep = 1.0
         self._merge_span = None
         self._merge_fired = False
+        # attention mask reference for pruning (set in collect before each forward)
+        self._current_attention_mask = None
 
     def _load_model(self, mid):
         import torch
@@ -171,11 +208,33 @@ class HFVLMBackend(VLMBackend):
         sp = self._merge_span
         if len(sp) <= 1:
             return None
-        merged = emb.clone()
-        merged[:, sp, :] = tome_merge_torch(emb[:, sp, :], self._merge_keep, self.torch)
-        self._merge_fired = True
-        kwargs["inputs_embeds"] = merged
-        return (args, kwargs)
+
+        method = self.cfg.compression_method
+
+        if method == "merge":
+            # ---- Token Merging (existing behaviour) ----
+            merged = emb.clone()
+            merged[:, sp, :] = tome_merge_torch(emb[:, sp, :], self._merge_keep, self.torch)
+            self._merge_fired = True
+            kwargs["inputs_embeds"] = merged
+            return (args, kwargs)
+
+        elif method == "prune":
+            # ---- Activation-Magnitude Pruning via Attention-Mask Zeroing ----
+            keep_mask = tome_prune_mask(len(sp), self._merge_keep,
+                                        emb[:, sp, :], self.torch)
+            # Zero the attention mask for pruned positions (shape: [B, seq_len])
+            attn = kwargs.get("attention_mask")
+            if attn is not None:
+                attn = attn.clone()
+                sp_tensor = self.torch.tensor(sp, device=attn.device)
+                pruned_positions = sp_tensor[~keep_mask]
+                attn[:, pruned_positions] = 0
+                kwargs["attention_mask"] = attn
+            self._merge_fired = True
+            return (args, kwargs)
+
+        return None
 
     def collect(self, keep_ratio, n, seed):
         torch = self.torch

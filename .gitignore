@@ -1,3 +1,8 @@
+# Smoke test
+csc_vlm/tests/smoke_test.py
+test_hook_local.py
+test_qwen_local.py
+
 # Results directories
 result_full/
 
