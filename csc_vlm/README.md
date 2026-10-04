@@ -63,6 +63,20 @@ python -m pytest tests/smoke_test.py -v
 
 ## Full 2×2×2 runs
 
+### ⚠️ Critical Step for SLURM Clusters
+Compute nodes are often air-gapped (no internet). If you submit a job with `HF_HUB_OFFLINE=1`, it will instantly crash if the models are not already downloaded. **Before submitting the job**, run these commands on the **login node** to pre-cache the heavy model weights:
+
+```bash
+# Install the HF CLI if you don't have it
+pip install -U "huggingface_hub[cli]"
+
+# Cache the weights directly to your HF_HOME
+huggingface-cli download llava-hf/llava-1.5-7b-hf
+huggingface-cli download Qwen/Qwen2.5-VL-7B-Instruct
+```
+
+### Running the Matrix
+
 The easiest way to execute the full 8-run experimental matrix (both models, both datasets, both methods) is to use the provided all-in-one bash script. It will automatically download/cache the datasets and loop through all combinations sequentially:
 
 ```bash
