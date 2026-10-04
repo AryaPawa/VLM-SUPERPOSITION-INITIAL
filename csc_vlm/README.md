@@ -63,30 +63,13 @@ python -m pytest tests/smoke_test.py -v
 
 ## Full 2×2×2 runs
 
-Pre-download the dataset on the login node first:
+The easiest way to execute the full 8-run experimental matrix (both models, both datasets, both methods) is to use the provided all-in-one bash script. It will automatically download/cache the datasets and loop through all combinations sequentially:
+
 ```bash
-python scripts/prepare_data.py --dataset hf:microsoft/cats_vs_dogs
-python scripts/build_person_dataset.py --download --output data/concept
+bash scripts/run_matrix.sh
 ```
 
-Then run all 8 combinations:
-```bash
-# LLaVA — cats_vs_dogs
-python run.py --model llava --dataset hf:microsoft/cats_vs_dogs --compression-method merge --out runs/llava_merge
-python run.py --model llava --dataset hf:microsoft/cats_vs_dogs --compression-method prune --out runs/llava_prune
-
-# LLaVA — coco_person
-python run.py --model llava --dataset coco_person --compression-method merge --out runs/llava_merge_person
-python run.py --model llava --dataset coco_person --compression-method prune --out runs/llava_prune_person
-
-# Qwen — cats_vs_dogs
-python run.py --model qwen --dataset hf:microsoft/cats_vs_dogs --compression-method merge --out runs/qwen_merge
-python run.py --model qwen --dataset hf:microsoft/cats_vs_dogs --compression-method prune --out runs/qwen_prune
-
-# Qwen — coco_person
-python run.py --model qwen --dataset coco_person --compression-method merge --out runs/qwen_merge_person
-python run.py --model qwen --dataset coco_person --compression-method prune --out runs/qwen_prune_person
-```
+If a run gets pre-empted, simply run the script again. It uses `--resume` under the hood and will instantly skip all models and grid points that have already completed.
 
 ### Resuming after pre-emption
 `--resume` is safe on first run too. It reloads the monitor and skips grid points already in `checkpoint.json`:
