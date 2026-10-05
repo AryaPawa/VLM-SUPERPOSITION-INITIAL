@@ -15,11 +15,19 @@ at a given visual-token keep ratio; everything downstream is model-agnostic.
                     - LLaVA-1.5-7b  (llava-hf/llava-1.5-7b-hf)
                     - Qwen2.5-VL-3B (Qwen/Qwen2.5-VL-3B-Instruct)
 
-                    Known-compatible lineages (same Prefix-LM architecture):
-                    - LLaVA-NeXT  (llava-hf/llava-v1.6-vicuna-7b-hf)
-                    - InternVL3   (OpenGVLab/InternVL3-8B)
-                    - SmolVLM     (HuggingFaceTB/SmolVLM-Instruct)
-                    - PaliGemma   (google/paligemma-3b-pt-224)
+                    Proposal model stack (all Prefix-LM, compatible):
+                    PRIMARY
+                    - llava-7b    : llava-hf/llava-1.5-7b-hf
+                    - llava-13b   : llava-hf/llava-1.5-13b-hf
+                    - llava-next  : llava-hf/llava-v1.6-vicuna-7b-hf
+                    - qwen-3b     : Qwen/Qwen2.5-VL-3B-Instruct
+                    - qwen        : Qwen/Qwen2.5-VL-7B-Instruct
+                    SECONDARY
+                    - internvl-2b : OpenGVLab/InternVL3-2B
+                    - internvl    : OpenGVLab/InternVL3-8B
+                    SLM ARM
+                    - smolvlm-500m: HuggingFaceTB/SmolVLM-500M-Instruct
+                    - smolvlm     : HuggingFaceTB/SmolVLM-2.2B-Instruct
 
                     NOT compatible (uses cross-attention, not concat):
                     - Llama-3.2-Vision (Meta), Flamingo (DeepMind)
@@ -173,14 +181,22 @@ class HFVLMBackend(VLMBackend):
     # Known model ID defaults keyed by a short name.
     # Add new short-names here for convenience; not required for compatibility.
     DEFAULTS = {
-        # primary (Tier-0 / proposal)
-        "llava":        "llava-hf/llava-1.5-7b-hf",
-        "qwen":         "Qwen/Qwen2.5-VL-7B-Instruct",
-        # extended (verified compatible, same Prefix-LM architecture)
-        "llava-next":   "llava-hf/llava-v1.6-vicuna-7b-hf",
-        "internvl":     "OpenGVLab/InternVL3-8B",
-        "smolvlm":      "HuggingFaceTB/SmolVLM-Instruct",
-        "paligemma":    "google/paligemma-3b-pt-224",
+        # --- PRIMARY (proposal Tier-0) ---
+        "llava":        "llava-hf/llava-1.5-7b-hf",       # LLaVA-1.5 7B
+        "llava-7b":     "llava-hf/llava-1.5-7b-hf",
+        "llava-13b":    "llava-hf/llava-1.5-13b-hf",      # LLaVA-1.5 13B
+        "llava-next":   "llava-hf/llava-v1.6-vicuna-7b-hf", # LLaVA-NeXT 7B
+        "qwen":         "Qwen/Qwen2.5-VL-7B-Instruct",    # Qwen2.5-VL 7B
+        "qwen-7b":      "Qwen/Qwen2.5-VL-7B-Instruct",
+        "qwen-3b":      "Qwen/Qwen2.5-VL-3B-Instruct",    # Qwen2.5-VL 3B
+        # --- SECONDARY (independent architecture family) ---
+        "internvl":     "OpenGVLab/InternVL3-8B",          # InternVL3 8B
+        "internvl-8b":  "OpenGVLab/InternVL3-8B",
+        "internvl-2b":  "OpenGVLab/InternVL3-2B",          # InternVL3 2B
+        # --- SLM ARM (smallest, predicted strongest effect) ---
+        "smolvlm":      "HuggingFaceTB/SmolVLM-2.2B-Instruct",  # SmolVLM 2.2B
+        "smolvlm-2b":   "HuggingFaceTB/SmolVLM-2.2B-Instruct",
+        "smolvlm-500m": "HuggingFaceTB/SmolVLM-500M-Instruct",  # SmolVLM 500M
     }
 
     # --------------------------------------------------------------------- #
