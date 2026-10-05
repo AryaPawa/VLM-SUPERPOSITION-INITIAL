@@ -42,7 +42,11 @@ from csc_vlm.data import DEFAULT_DATASET                        # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser(description="CSC VLM compression-safety frontier (grid search)")
-    ap.add_argument("--model", choices=["mock", "llava", "qwen"], default="mock")
+    ap.add_argument("--model",
+                    default="mock",
+                    help="Short model name: 'mock' (CPU), 'llava', 'qwen', 'llava-next', "
+                         "'internvl', 'smolvlm', 'paligemma', or any free-form name "
+                         "when paired with --model-id <hf_id>")
     ap.add_argument("--model-id", default="", help="HF model id (defaults per lineage)")
     ap.add_argument("--dataset", default=DEFAULT_DATASET,
                     help="synthetic | folder:/path | coco_person[:/path] | hf:<name>")
