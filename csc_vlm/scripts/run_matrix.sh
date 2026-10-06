@@ -73,7 +73,7 @@ for model in "${MODELS[@]}"; do
                 --dataset "$dataset" \
                 --compression-method "$method" \
                 --out "$out_dir" \
-                --resume
+                --resume || echo "⚠️ Run $COUNT exited with a non-zero code. Continuing to next..."
 
             COUNT=$((COUNT+1))
         done
