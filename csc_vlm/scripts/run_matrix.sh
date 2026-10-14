@@ -6,6 +6,16 @@
 
 set -e
 
+# --- v2 FIX: never --resume stale (pre-hook-fix) results. The old runs/ holds
+# flat-noise checkpoints; with --resume the fixed hook would be SKIPPED and the
+# junk reused. Move any existing runs/ aside so every grid point is re-measured. ---
+if [ -d runs ] && [ -n "$(ls -A runs 2>/dev/null)" ]; then
+    backup="runs_backup_$(date +%Y%m%d_%H%M%S)"
+    echo "[safety] existing runs/ found -> moving to $backup (fresh run with fixed hook)"
+    mv runs "$backup"
+fi
+mkdir -p runs
+
 echo "======================================================"
 echo " CSC-VLM: Full Experimental Matrix (36 runs)"
 echo " Models:  9 (LLaVA-1.5 7B/13B, LLaVA-NeXT, Qwen 3B/7B,"

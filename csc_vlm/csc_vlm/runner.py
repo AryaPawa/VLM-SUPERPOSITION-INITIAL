@@ -203,6 +203,30 @@ def run_frontier(cfg: VLMConfig, dataset: str, outdir: str,
         print(f"[monitor] d_eff(uncompressed)={g0['d_eff']:.1f} "
               f"‖a‖={g0['leverage']:.3f} Γ={g0['gamma_r']:.3f}")
 
+    # ------ HARD compression gate (defuse the "hook silently did nothing" bug) ------
+    # Collect at keep=1.0 and keep=0.3 on the SAME image sample (same seed), so any
+    # difference in the pooled read is caused ONLY by compression. If the hook did
+    # not fire, or the read is unchanged, ABORT rather than produce a flat-noise
+    # frontier (the exact failure that invalidated the first 36-run matrix).
+    if cfg.model != "mock":
+        gseed = 4242
+        n_gate = min(8, cfg.n_pairs)
+        Ha, _ = backend.collect(cfg.keep_max, n_gate, seed=gseed)
+        backend._merge_fired = False
+        Hb, _ = backend.collect(0.30, n_gate, seed=gseed)
+        fired = bool(getattr(backend, "_merge_fired", False))
+        base = float(np.mean(np.abs(Ha.mean(0)))) + 1e-9
+        rel = float(np.mean(np.abs(Ha.mean(0) - Hb.mean(0)))) / base
+        print(f"[gate] compression check: hook_fired={fired}  "
+              f"read Δrel(keep 1.0 vs 0.3)={rel:.4f}")
+        if (not fired) or rel < 1e-3:
+            raise RuntimeError(
+                "COMPRESSION GATE FAILED: the compression hook did not change the read "
+                f"activations (hook_fired={fired}, Δrel={rel:.4f}). Run aborted to avoid a "
+                "flat-noise frontier. Fix _candidate_hook_modules/_pre_hook for this "
+                "architecture, confirm with `python run.py --model <m> --self-check`, then "
+                "re-run into a FRESH --out dir.")
+
     oracle = VLMSafetyOracle(backend, cfg, w_b, U)
 
     # ------ Grid Search ------

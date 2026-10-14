@@ -236,6 +236,8 @@ class HFVLMBackend(VLMBackend):
         self._merge_keep = 1.0
         self._merge_span = None
         self._merge_fired = False
+        self._read_positions = None        # positions to pool for the read (per forward)
+        self._compressed_this_pass = False # once-per-forward guard
 
     # ------------------------------------------------------------------ #
     # Auto-detection helpers
@@ -361,10 +363,58 @@ class HFVLMBackend(VLMBackend):
     # ------------------------------------------------------------------ #
     # Compression hook (shared for all architectures)
     # ------------------------------------------------------------------ #
-    def _pre_hook(self, module, args, kwargs):
+    def _candidate_hook_modules(self):
+        """Every plausible text-backbone sub-module that may be *called with
+        `inputs_embeds`*. We hook them all and act on whichever one actually
+        receives inputs_embeds at run time (outermost first, guarded by a
+        once-per-forward flag).
+
+        WHY: modern transformers nests the text model one level deeper than older
+        releases (e.g. `model.model.language_model`), while the old hard-coded path
+        (`model.language_model`) now points at a wrapper that is called with
+        `input_ids` + `pixel_values` and never sees `inputs_embeds` -> the hook
+        silently no-ops for BOTH merge and prune. Hooking every candidate makes the
+        compression fire regardless of how deeply the text model is nested."""
+        nn = self.torch.nn
+        mods, seen = [], set()
+
+        def add(m):
+            if isinstance(m, nn.Module) and id(m) not in seen:
+                seen.add(id(m)); mods.append(m)
+
+        for root in (self.model, getattr(self.model, "model", None)):
+            if root is None:
+                continue
+            add(root)
+            for attr in ("language_model", "text_model", "model"):
+                add(getattr(root, attr, None))
+        return mods
+
+    def _find_embeds(self, args, kwargs):
+        """Locate the inputs_embeds tensor in a module's call, whether it was passed
+        by keyword OR positionally. Returns (tensor, 'kwargs'|position_index|None).
+        The positional fallback (a 3-D float tensor whose last dim == hidden size)
+        makes the hook robust to models that pass inputs_embeds positionally."""
         emb = kwargs.get("inputs_embeds")
-        if emb is None or self._merge_keep >= 1.0 or self._merge_span is None:
+        if emb is not None:
+            return emb, "kwargs"
+        for j, a in enumerate(args):
+            try:
+                if (hasattr(a, "dim") and a.dim() == 3
+                        and int(a.shape[-1]) == int(self._d)
+                        and a.is_floating_point()):
+                    return a, j
+            except Exception:
+                continue
+        return None, None
+
+    def _pre_hook(self, module, args, kwargs):
+        # Act only on the module that truly receives inputs_embeds, once per pass.
+        if self._compressed_this_pass or self._merge_keep >= 1.0 or self._merge_span is None:
             return None
+        emb, loc = self._find_embeds(args, kwargs)
+        if emb is None:
+            return None                      # not the inputs_embeds entry point; skip
         sp = self._merge_span
         if len(sp) <= 1:
             return None
@@ -372,25 +422,39 @@ class HFVLMBackend(VLMBackend):
         method = self.cfg.compression_method
 
         if method == "merge":
-            # ---- Token Merging ----
+            # ---- Token Merging: blend carriers, PRESERVE information ----
             merged = emb.clone()
             merged[:, sp, :] = tome_merge_torch(emb[:, sp, :], self._merge_keep, self.torch)
+            self._read_positions = list(sp)          # pool the full merged span
             self._merge_fired = True
-            kwargs["inputs_embeds"] = merged
-            return (args, kwargs)
+            self._compressed_this_pass = True
+            if loc == "kwargs":
+                kwargs["inputs_embeds"] = merged
+                return (args, kwargs)
+            new_args = list(args)                     # positional: swap it back in place
+            new_args[loc] = merged
+            return (tuple(new_args), kwargs)
 
         elif method == "prune":
-            # ---- Activation-Magnitude Pruning via Attention-Mask Zeroing ----
+            # ---- Activation-Magnitude Pruning: DROP carriers + their information ----
             keep_mask = tome_prune_mask(len(sp), self._merge_keep,
                                         emb[:, sp, :], self.torch)
+            km = keep_mask.detach().cpu().numpy().astype(bool)
+            kept = [sp[i] for i in range(len(sp)) if km[i]]
+            # (a) stop surviving tokens from attending to pruned ones (when we can)
             attn = kwargs.get("attention_mask")
             if attn is not None:
-                attn = attn.clone()
-                sp_tensor = self.torch.tensor(sp, device=attn.device)
-                pruned_positions = sp_tensor[~keep_mask]
-                attn[:, pruned_positions] = 0
-                kwargs["attention_mask"] = attn
+                pruned = [sp[i] for i in range(len(sp)) if not km[i]]
+                if pruned:
+                    attn = attn.clone()
+                    pr = self.torch.tensor(pruned, device=attn.device, dtype=self.torch.long)
+                    attn[:, pr] = 0
+                    kwargs["attention_mask"] = attn
+            # (b) the read pools ONLY the surviving tokens -> genuine information
+            #     removal; this is the honest contrast to merge (which keeps it).
+            self._read_positions = kept if kept else list(sp)
             self._merge_fired = True
+            self._compressed_this_pass = True
             return (args, kwargs)
 
         return None
@@ -403,20 +467,26 @@ class HFVLMBackend(VLMBackend):
         rng = np.random.default_rng(seed)
         idx = rng.choice(len(self.images), size=min(n, len(self.images)),
                          replace=len(self.images) < n)
-        lm = self._detect_lm_module()
-        handle = lm.register_forward_pre_hook(self._pre_hook, with_kwargs=True)
+        # register the pre-hook on EVERY candidate text-backbone module; the hook
+        # self-selects the one that actually receives inputs_embeds.
+        handles = [m.register_forward_pre_hook(self._pre_hook, with_kwargs=True)
+                   for m in self._candidate_hook_modules()]
         self._merge_keep = float(keep_ratio)
         H, y = [], []
         try:
             for i in idx:
                 inp = self._prepare(self.images[i])
                 self._merge_span = self._visual_span(inp)
+                self._read_positions = list(self._merge_span)   # default: full span
+                self._compressed_this_pass = False
                 with torch.no_grad():
                     out = self.model(**inp, output_hidden_states=True)
                 hs = out.hidden_states[self.read_layer][0]      # [seq, d]
-                h = hs[self._merge_span].mean(0).float().cpu().numpy()
+                read_pos = self._read_positions or self._merge_span
+                h = hs[read_pos].mean(0).float().cpu().numpy()
                 H.append(h)
                 y.append(int(self.labels[i]))
         finally:
-            handle.remove()
+            for hd in handles:
+                hd.remove()
         return np.asarray(H), np.asarray(y)
