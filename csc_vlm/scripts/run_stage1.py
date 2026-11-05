@@ -32,7 +32,6 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from csc_vlm import evasion  # noqa: E402
 from csc_vlm.evasion import run_stage1, Stage1Mock, DEFAULT_KEEPS, METHODS  # noqa: E402
 
 
@@ -134,8 +133,12 @@ def main():
     ap.add_argument("--keeps", default="")
     ap.add_argument("--methods", default=",".join(METHODS))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-staleness", action="store_true",
+                    help="skip the frozen-monitor gradients (halves backward passes; "
+                         "no refit-vs-frozen staleness panel). Use for large models.")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
+    staleness = not args.no_staleness
 
     keeps = ([float(x) for x in args.keeps.split(",")] if args.keeps else list(DEFAULT_KEEPS))
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
@@ -144,7 +147,7 @@ def main():
     if args.self_check:
         print("[self-check] mock Jacobians (no torch); validating Γ_r / OC / decomp / placebo ...")
         coll = Stage1Mock(dim=240, rank=args.rank, n=args.n_images, seed=0)
-        R = run_stage1(coll, keeps=keeps, methods=methods, rank=args.rank, n_images=args.n_images)
+        R = run_stage1(coll, keeps=keeps, methods=methods, rank=args.rank, n_images=args.n_images, staleness=staleness)
         assert R["merge"]["beta_oc_per_logunit"] > 0, "merge OC should fall with compression"
         assert R["merge"]["decomp"]["share_gamma"] > R["prune"]["decomp"]["share_gamma"], \
             "merge should be more evasion-driven than prune"
@@ -164,7 +167,7 @@ def main():
                            n_eval=min(args.n_images, len(images)), n_monitor=args.n_monitor,
                            seed=args.seed)
         coll = Stage1VLM(cfg, images, labels, dtype=args.dtype)
-        R = run_stage1(coll, keeps=keeps, methods=methods, rank=args.rank, n_images=args.n_images)
+        R = run_stage1(coll, keeps=keeps, methods=methods, rank=args.rank, n_images=args.n_images, staleness=staleness)
 
     out_json = os.path.join(args.out, "stage1_results.json")
     out_png = os.path.join(args.out, "stage1.png")

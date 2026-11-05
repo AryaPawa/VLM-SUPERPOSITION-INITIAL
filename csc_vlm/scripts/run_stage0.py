@@ -34,9 +34,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from csc_vlm import stage0  # noqa: E402
 from csc_vlm.stage0 import (Stage0Mock, Stage0VLM, Stage0Config, run_stage0,
-                            DEFAULT_KEEPS, METHODS, BEHAVIOURS)  # noqa: E402
+                            DEFAULT_KEEPS, METHODS)  # noqa: E402
 
 ALL_METHODS = list(METHODS) + ["readout_only"]
 
