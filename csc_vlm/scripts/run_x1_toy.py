@@ -128,7 +128,6 @@ def _decompose_slopes(fr):
     """log OC = log margin - log||g|| - log Gamma. Slopes vs log keep; share of
     the OC slope carried by the Gamma (escape/evasion) term vs the margin (info)
     term."""
-    lk = np.log(fr["keep"])
     s_oc = fit_loglog_slope(fr["keep"], fr["new_oc"])
     s_m = fit_loglog_slope(fr["keep"], fr["new_margin"])
     s_g = fit_loglog_slope(fr["keep"], fr["new_gnorm"])

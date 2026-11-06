@@ -1,7 +1,13 @@
-# Smoke test
-csc_vlm/tests/smoke_test.py
+# Local scratch test scripts (not the committed smoke test)
 test_hook_local.py
 test_qwen_local.py
+
+# Run artifacts (never commit)
+runs/
+runs_stage0/
+runs_stage1/
+toy_x1.png
+toy_x1_results.json
 
 # Results directories
 result_full/

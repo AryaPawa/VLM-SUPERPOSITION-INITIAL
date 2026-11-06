@@ -22,12 +22,12 @@ at a given visual-token keep ratio; everything downstream is model-agnostic.
                     - llava-next  : llava-hf/llava-v1.6-vicuna-7b-hf
                     - qwen-3b     : Qwen/Qwen2.5-VL-3B-Instruct
                     - qwen        : Qwen/Qwen2.5-VL-7B-Instruct
-                    SECONDARY
-                    - internvl-2b : OpenGVLab/InternVL3-2B
-                    - internvl    : OpenGVLab/InternVL3-8B
+                    SECONDARY (use the transformers-native "-hf" conversions)
+                    - internvl-2b : OpenGVLab/InternVL3-2B-hf
+                    - internvl    : OpenGVLab/InternVL3-8B-hf
                     SLM ARM
                     - smolvlm-500m: HuggingFaceTB/SmolVLM-500M-Instruct
-                    - smolvlm     : HuggingFaceTB/SmolVLM-2.2B-Instruct
+                    - smolvlm     : HuggingFaceTB/SmolVLM2-2.2B-Instruct
 
                     NOT compatible (uses cross-attention, not concat):
                     - Llama-3.2-Vision (Meta), Flamingo (DeepMind)
