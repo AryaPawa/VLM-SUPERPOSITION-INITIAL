@@ -1,90 +1,82 @@
 #!/bin/bash
 # run_matrix.sh
-# Runs the full 9x2x2 experimental matrix (36 runs) sequentially on a single GPU.
-# Estimated time on H100: ~2.2 hours.
-# Safe to re-submit after pre-emption: --resume skips completed grid points.
+# Runs the 2x2x2 experimental matrix (8 runs) sequentially on a single GPU:
+#   models   = llava, qwen         (edit MODELS below to add more)
+#   datasets = cats_vs_dogs, coco_person
+#   methods  = merge, prune
+# Matches the README ("Full 8-run runs"). Estimated time on one H100: ~30-45 min.
+#
+# RESUME: re-running after a pre-emption RESUMES — each run uses --resume and skips
+# grid points already in its checkpoint.json. Nothing is deleted.
+# FRESH RUN: to force every grid point to be re-measured (e.g. after changing the
+# metric/hook code), start fresh with:   FRESH=1 bash scripts/run_matrix.sh
+# (that moves any existing runs/ aside to runs_backup_<timestamp>/).
 
-set -e
+set -uo pipefail                 # NOT -e: one failed run/download must not abort the matrix
 
-# --- v2 FIX: never --resume stale (pre-hook-fix) results. The old runs/ holds
-# flat-noise checkpoints; with --resume the fixed hook would be SKIPPED and the
-# junk reused. Move any existing runs/ aside so every grid point is re-measured. ---
-if [ -d runs ] && [ -n "$(ls -A runs 2>/dev/null)" ]; then
+FRESH="${FRESH:-0}"
+if [ "$FRESH" = "1" ] && [ -d runs ] && [ -n "$(ls -A runs 2>/dev/null)" ]; then
     backup="runs_backup_$(date +%Y%m%d_%H%M%S)"
-    echo "[safety] existing runs/ found -> moving to $backup (fresh run with fixed hook)"
+    echo "[fresh] FRESH=1 set -> moving existing runs/ to $backup"
     mv runs "$backup"
 fi
 mkdir -p runs
 
-echo "======================================================"
-echo " CSC-VLM: Full Experimental Matrix (36 runs)"
-echo " Models:  9 (LLaVA-1.5 7B/13B, LLaVA-NeXT, Qwen 3B/7B,"
-echo "             InternVL3 2B/8B, SmolVLM 500M/2.2B)"
-echo " Datasets: 2 (cats_vs_dogs, coco_person)"
-echo " Methods:  2 (merge, prune)"
-echo "======================================================"
-
-# 1. Ensure the COCO Person dataset is built first
-echo ""
-echo "[1/3] Preparing COCO Person concept dataset..."
-python scripts/build_person_dataset.py --download --output data/concept
-
-# 2. Ensure Cats vs Dogs is cached
-echo "[2/3] Caching Hugging Face Cats vs Dogs..."
-python scripts/prepare_data.py --dataset hf:microsoft/cats_vs_dogs
-
-echo "[3/3] Commencing 9x2x2 Matrix..."
-
 # --------------------------------------------------------------------- #
-# Model stack (matches research proposal table exactly)
-# Format: "short_name"
+# Model stack. DEFAULT = the two primary models (README's 2x2x2 = 8 runs).
+# Uncomment the rest for the full proposal stack (then pre-cache ALL of them on
+# the login node, and expect ~36 runs).
 # --------------------------------------------------------------------- #
 MODELS=(
-    # PRIMARY
     "llava"           # LLaVA-1.5 7B
-    "llava-13b"       # LLaVA-1.5 13B
-    "llava-next"      # LLaVA-NeXT 7B
-    "qwen-3b"         # Qwen2.5-VL 3B
     "qwen"            # Qwen2.5-VL 7B
-    # SECONDARY
-    "internvl-2b"     # InternVL3 2B
-    "internvl"        # InternVL3 8B
-    # SLM ARM
-    "smolvlm-500m"    # SmolVLM 500M
-    "smolvlm"         # SmolVLM 2.2B
+    # "llava-13b"     # LLaVA-1.5 13B
+    # "llava-next"    # LLaVA-NeXT 7B
+    # "qwen-3b"       # Qwen2.5-VL 3B
+    # "internvl-2b"   # InternVL3 2B  (uses OpenGVLab/InternVL3-2B-hf)
+    # "internvl"      # InternVL3 8B  (uses OpenGVLab/InternVL3-8B-hf)
+    # "smolvlm-500m"  # SmolVLM 500M
+    # "smolvlm"       # SmolVLM2 2.2B
 )
-
 DATASETS=("hf:microsoft/cats_vs_dogs" "coco_person")
 METHODS=("merge" "prune")
 
 TOTAL=$(( ${#MODELS[@]} * ${#DATASETS[@]} * ${#METHODS[@]} ))
-COUNT=1
+echo "======================================================"
+echo " CSC-VLM: ${#MODELS[@]}x2x2 matrix = $TOTAL runs"
+echo " Models: ${MODELS[*]}"
+echo "======================================================"
 
+# 1. Build the COCO Person dataset (non-fatal: cats_vs_dogs runs still proceed if it fails)
+echo "[1/3] Preparing COCO Person concept dataset..."
+python scripts/build_person_dataset.py --download --output data/concept \
+    || echo "[warn] person dataset build failed; coco_person runs may be skipped"
+
+# 2. Cache Cats vs Dogs
+echo "[2/3] Caching Hugging Face Cats vs Dogs..."
+python scripts/prepare_data.py --dataset hf:microsoft/cats_vs_dogs \
+    || echo "[warn] cats_vs_dogs cache step failed; the run will try to download on first use"
+
+echo "[3/3] Commencing ${#MODELS[@]}x2x2 matrix..."
+COUNT=1
 for model in "${MODELS[@]}"; do
     for dataset in "${DATASETS[@]}"; do
         for method in "${METHODS[@]}"; do
-
-            # Format a clean run directory name
             dataset_name="cats_dogs"
-            if [ "$dataset" = "coco_person" ]; then
-                dataset_name="person"
-            fi
-
+            [ "$dataset" = "coco_person" ] && dataset_name="person"
             out_dir="runs/${model}_${method}_${dataset_name}"
-
             echo ""
             echo "------------------------------------------------------"
-            echo " RUN $COUNT/$TOTAL: Model=$model | Data=$dataset_name | Method=$method"
-            echo " Output: $out_dir"
+            echo " RUN $COUNT/$TOTAL: model=$model data=$dataset_name method=$method"
+            echo " out: $out_dir"
             echo "------------------------------------------------------"
-
             python run.py \
                 --model "$model" \
                 --dataset "$dataset" \
                 --compression-method "$method" \
                 --out "$out_dir" \
-                --resume || echo "⚠️ Run $COUNT exited with a non-zero code. Continuing to next..."
-
+                --resume \
+              || echo "[warn] run $COUNT ($model/$dataset_name/$method) exited non-zero; continuing"
             COUNT=$((COUNT+1))
         done
     done
@@ -92,6 +84,6 @@ done
 
 echo ""
 echo "======================================================"
-echo " All $TOTAL runs completed successfully!"
-echo " Results are located in the 'runs/' directory."
+echo " Matrix finished ($TOTAL runs attempted). Results in runs/"
+echo " Re-run to resume anything that failed/was pre-empted."
 echo "======================================================"

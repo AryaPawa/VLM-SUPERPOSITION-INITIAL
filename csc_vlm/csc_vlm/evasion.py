@@ -39,7 +39,6 @@ per image. On 16 GB (Kaggle T4/P100) prefer the 3B / SLM models in fp32, or 7B i
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -68,15 +67,20 @@ def _ortho_basis(G: np.ndarray) -> np.ndarray:
     return Q[:, keep]
 
 
+def escape_with_basis(g: np.ndarray, Q: np.ndarray) -> float:
+    """Gamma for direction g given a precomputed orthonormal monitor basis Q
+    (columns). Avoids re-running QR for every call (real + every placebo draw)."""
+    gnorm = float(np.linalg.norm(g))
+    if gnorm < EPS:
+        return 0.0
+    esc = g - (Q @ (Q.T @ g)) if Q.shape[1] else g
+    return float(np.linalg.norm(esc) / gnorm)
+
+
 def escape_fraction(g_b: np.ndarray, G_U: np.ndarray) -> float:
     """Gamma_r = ||P_{span(G_U)^perp} g_b|| / ||g_b||. The share of the behaviour-
     moving direction that lies outside everything the monitor can see."""
-    gnorm = float(np.linalg.norm(g_b))
-    if gnorm < EPS:
-        return 0.0
-    Q = _ortho_basis(G_U)
-    esc = g_b - (Q @ (Q.T @ g_b)) if Q.shape[1] else g_b
-    return float(np.linalg.norm(esc) / gnorm)
+    return escape_with_basis(g_b, _ortho_basis(G_U))
 
 
 def oc_value(margin: float, g_norm: float, gamma: float, beta: float = 1.0) -> float:
@@ -84,15 +88,16 @@ def oc_value(margin: float, g_norm: float, gamma: float, beta: float = 1.0) -> f
     return float(beta * abs(margin) / (g_norm * gamma + EPS))
 
 
-def placebo_gamma(dim: int, G_U: np.ndarray, n: int = 8, seed: int = 0) -> float:
+def placebo_gamma(dim: int, G_U: np.ndarray, n: int = 8, seed: int = 0,
+                  Q: Optional[np.ndarray] = None) -> float:
     """Gamma of a RANDOM-direction 'behaviour'. The null: a random direction escapes
     an r-dim monitor almost entirely (~sqrt((dim-r)/dim)); it must show NO compression
-    trend. If the real Gamma just tracks this, the trend is geometry, not the behaviour."""
+    trend. If the real Gamma just tracks this, the trend is geometry, not the behaviour.
+    Pass Q (precomputed monitor basis) to skip the QR."""
+    if Q is None:
+        Q = _ortho_basis(G_U)
     rng = np.random.default_rng(seed)
-    vals = []
-    for _ in range(n):
-        g = rng.standard_normal(dim)
-        vals.append(escape_fraction(g, G_U))
+    vals = [escape_with_basis(rng.standard_normal(dim), Q) for _ in range(n)]
     return float(np.median(vals))
 
 
@@ -144,19 +149,19 @@ def build_monitor_subspace(H: np.ndarray, y: np.ndarray, rank: int) -> np.ndarra
 # orchestration (collector-agnostic)
 # --------------------------------------------------------------------------- #
 def run_stage1(collector, keeps=DEFAULT_KEEPS, methods=METHODS, rank: int = 8,
-               n_images: int = 96) -> Dict:
+               n_images: int = 96, staleness: bool = True) -> Dict:
     """collector must implement:
          fit_monitor(keep, method, rank) -> (U_refit, U_frozen)  [D,r] each
-         per_image(keep, method, U_refit, U_frozen, n) -> dict of arrays:
-             gamma[n], gamma_frozen[n], g_norm[n], margin[n], oc[n], dim(int)
+         per_image(keep, method, U_refit, U_frozen, n, staleness) -> dict of arrays:
+             gamma[n], gamma_frozen[n], gamma_placebo[n], g_norm[n], margin[n], oc[n], dim(int)
        Both numpy; no torch needed by the orchestration."""
     results = {"keeps": list(keeps), "methods": list(methods), "rank": rank,
-               "config": collector.describe()}
+               "staleness": staleness, "config": collector.describe()}
     for method in methods:
         rows = []
         for keep in keeps:
             U_r, U_f = collector.fit_monitor(keep, method, rank)
-            pk = collector.per_image(keep, method, U_r, U_f, n_images)
+            pk = collector.per_image(keep, method, U_r, U_f, n_images, staleness)
             rows.append({
                 "keep": keep,
                 "gamma": float(np.median(pk["gamma"])),
@@ -206,6 +211,10 @@ class Stage1VLM:
         # (7B won't fit 16 GB -> use a 3B/SLM in fp32, or 7B in bf16 on Ampere).
         if self._dtype != torch.float16:
             self.model = self.model.to(self._dtype)
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            print("[stage1][warn] >1 GPU visible: the backend shards with device_map='auto', "
+                  "and the fp32 cast + autograd want one device. Run Stage 1 with "
+                  "CUDA_VISIBLE_DEVICES=0 to pin a single GPU.")
         # per-forward state for the differentiable hook
         self._keep = 1.0; self._method = "merge"; self._span = None
         self._v = None; self._fired = False; self._call_id = 0
@@ -218,10 +227,14 @@ class Stage1VLM:
     def fit_monitor(self, keep, method, rank):
         mon = self.s0._collect_idx(keep, method, self._mon_idx)        # no-grad reads
         U_r = build_monitor_subspace(mon["last"], mon["y"], rank)
-        if abs(keep - 1.0) < 1e-9:
-            self._U_frozen_cache = U_r
-        U_f = getattr(self, "_U_frozen_cache", U_r)
-        return U_r, U_f
+        # frozen monitor = the keep=1.0 fit (uncompressed reads are method-independent).
+        # Compute once; if this call is at keep=1.0 reuse its reads, else collect once.
+        if getattr(self, "_frozen_rank", None) != rank:
+            mon0 = mon if abs(keep - 1.0) < 1e-9 else \
+                self.s0._collect_idx(1.0, "merge", self._mon_idx)
+            self._U_frozen_cache = build_monitor_subspace(mon0["last"], mon0["y"], rank)
+            self._frozen_rank = rank
+        return U_r, self._U_frozen_cache
 
     # --- the differentiable compression hook (splices a leaf carrier tensor) ---
     def _grad_hook(self, module, args, kwargs):
@@ -265,8 +278,10 @@ class Stage1VLM:
         na = list(args); na[loc] = new_emb
         return (tuple(na), kwargs)
 
-    def _jacobian_one(self, i, keep, method, U):
-        """Returns (g_b[dim], G_U[r,dim], margin, ok). r+1 backward passes."""
+    def _jacobian_multi(self, i, keep, method, U_list):
+        """ONE forward; returns (g_b[dim], [G_U per U in U_list], margin, ok).
+        The read-position Jacobian is shared, so several monitors cost only their
+        own backward passes (1 for g_b + sum of each monitor's r columns)."""
         torch = self.torch
         handles = [m.register_forward_pre_hook(self._grad_hook, with_kwargs=True)
                    for m in self.backend._candidate_hook_modules()]
@@ -279,39 +294,72 @@ class Stage1VLM:
                 return None, None, None, False            # hook did not fire
             logit = out.logits[0, -1, :].to(torch.float32)
             b = logit[self._pos_id] - logit[self._neg_id]
-            h_last = out.hidden_states[self.read_layer][0, -1, :].to(torch.float32)
-            g_b = torch.autograd.grad(b, self._v, retain_graph=True)[0].reshape(-1)
-            Ut = torch.as_tensor(U.T, dtype=torch.float32, device=h_last.device)  # [r, D]
-            rows = []
-            r = Ut.shape[0]
-            for j in range(r):
-                mj = (Ut[j] * h_last).sum()
-                gj = torch.autograd.grad(mj, self._v, retain_graph=(j < r - 1))[0].reshape(-1)
-                rows.append(gj.detach().float().cpu().numpy())
-            return (g_b.detach().float().cpu().numpy(), np.stack(rows, 0),
+            ri = min(self.read_layer, len(out.hidden_states) - 1)   # clamp defensively
+            h_last = out.hidden_states[ri][0, -1, :].to(torch.float32)
+            # flatten all monitor directions across the U_list, backward once each,
+            # keeping the graph alive until the final one.
+            cols = []                       # (list_index, D-vector)
+            for li, U in enumerate(U_list):
+                for j in range(U.shape[1]):
+                    cols.append((li, U[:, j]))
+            # allow_unused: if a model re-embeds from input_ids and ignores our spliced
+            # inputs_embeds, the carriers are disconnected -> grad is None -> skip the
+            # image cleanly instead of crashing the whole run.
+            g = torch.autograd.grad(b, self._v, retain_graph=True, allow_unused=True)[0]
+            if g is None:
+                return None, None, None, False
+            g_b = g.reshape(-1)
+            G = [[] for _ in U_list]
+            for t, (li, u) in enumerate(cols):
+                ut = torch.as_tensor(u, dtype=torch.float32, device=h_last.device)
+                mj = (ut * h_last).sum()
+                gj = torch.autograd.grad(mj, self._v, retain_graph=(t < len(cols) - 1),
+                                         allow_unused=True)[0]
+                if gj is None:
+                    gj = torch.zeros_like(self._v)
+                G[li].append(gj.detach().float().cpu().numpy().reshape(-1))
+            G_list = [np.stack(rows, 0) for rows in G]
+            return (g_b.detach().float().cpu().numpy(), G_list,
                     float(b.detach().float().cpu()), True)
         finally:
             for h in handles:
                 h.remove()
 
-    def per_image(self, keep, method, U_refit, U_frozen, n):
+    def per_image(self, keep, method, U_refit, U_frozen, n, staleness=True):
         idx = self._eval_idx[:n]
+        U_list = [U_refit, U_frozen] if staleness else [U_refit]
         gam, gamf, gamp, gn, mar, oc = [], [], [], [], [], []
+        dim = 0
         for c, i in enumerate(idx):
             self._call_id = c
-            g_b, G_U, b, ok = self._jacobian_one(i, keep, method, U_refit)
+            try:
+                g_b, G_list, b, ok = self._jacobian_multi(i, keep, method, U_list)
+            except Exception as e:                       # corrupt image / OOM on one sample
+                print(f"[stage1][warn] image {int(i)} failed ({type(e).__name__}: "
+                      f"{str(e)[:120]}); skipping")
+                continue
             if not ok:
                 continue
-            _, G_Uf, _, okf = self._jacobian_one(i, keep, method, U_frozen)
+            dim = g_b.size
             gnorm = float(np.linalg.norm(g_b))
-            gamma = escape_fraction(g_b, G_U)
-            gammaf = escape_fraction(g_b, G_Uf) if okf else gamma
+            Q_ref = _ortho_basis(G_list[0])                 # QR once, reuse for placebo
+            gamma = escape_with_basis(g_b, Q_ref)
+            if staleness:
+                gammaf = escape_fraction(g_b, G_list[1])
+            else:
+                gammaf = gamma
             gam.append(gamma); gamf.append(gammaf)
-            gamp.append(placebo_gamma(g_b.size, G_U, seed=c))
+            gamp.append(placebo_gamma(g_b.size, None, seed=c, Q=Q_ref))
             gn.append(gnorm); mar.append(abs(b)); oc.append(oc_value(abs(b), gnorm, gamma))
+        if not oc:
+            print(f"[stage1][warn] no image produced a gradient at keep={keep} "
+                  f"method={method} (hook may not have fired). Returning NaNs.")
+            nan = np.array([np.nan])
+            return {"gamma": nan, "gamma_frozen": nan, "gamma_placebo": nan,
+                    "g_norm": nan, "margin": nan, "oc": nan, "dim": 0}
         return {"gamma": np.array(gam), "gamma_frozen": np.array(gamf),
                 "gamma_placebo": np.array(gamp), "g_norm": np.array(gn),
-                "margin": np.array(mar), "oc": np.array(oc), "dim": g_b.size}
+                "margin": np.array(mar), "oc": np.array(oc), "dim": dim}
 
 
 # --------------------------------------------------------------------------- #
@@ -336,7 +384,7 @@ class Stage1Mock:
     def fit_monitor(self, keep, method, rank):
         return self._U[:, :rank], self._U[:, :rank]
 
-    def per_image(self, keep, method, U_refit, U_frozen, n):
+    def per_image(self, keep, method, U_refit, U_frozen, n, staleness=True):
         rng = np.random.default_rng(self.seed + int(100 * keep) + hash(method) % 1000)
         G_U = U_refit.T                        # monitor gradients = its directions
         frac_out = {"merge": 0.2 + 0.7 * (1 - keep),

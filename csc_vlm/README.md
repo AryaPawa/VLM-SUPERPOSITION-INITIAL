@@ -29,6 +29,15 @@ The harness supports the 2×2×2 matrix:
 | **Dataset** | `hf:microsoft/cats_vs_dogs` (benign), `coco_person` (safety-relevant) |
 | **Compression method** | `merge` (token averaging), `prune` (activation-magnitude pruning) |
 
+`scripts/run_matrix.sh` runs this default 2×2×2 = **8 runs**. To expand to the full
+proposal stack, uncomment the extra models in that script (and pre-cache them on the
+login node). Their short names and the exact HF ids the backend uses:
+`llava-13b`, `llava-next`, `qwen-3b`, `internvl-2b` → `OpenGVLab/InternVL3-2B-hf`,
+`internvl` → `OpenGVLab/InternVL3-8B-hf`, `smolvlm-500m` → `HuggingFaceTB/SmolVLM-500M-Instruct`,
+`smolvlm` → `HuggingFaceTB/SmolVLM2-2.2B-Instruct`. (The InternVL `-hf` conversions and the
+SmolVLM2 id are required — the plain `OpenGVLab/InternVL3-*` and `SmolVLM-2.2B-Instruct` ids
+do not load with the standard auto-class.)
+
 ---
 
 ## Setup
@@ -122,6 +131,13 @@ Groups contiguous visual tokens into `k = round(keep_ratio × T)` buckets and re
 ## Troubleshooting
 
 - **`AutoModelForImageTextToText` not found** → `pip install -U "transformers>=4.49"`
+- **InternVL fails to load** → use the `-hf` ids (the `internvl`/`internvl-2b` short names
+  already map to `OpenGVLab/InternVL3-{8B,2B}-hf`). The plain `OpenGVLab/InternVL3-*` repos
+  ship custom code that needs `AutoModel`+`trust_remote_code`; the loader will try that too,
+  but the `-hf` conversion is the supported path.
+- **SmolVLM 2.2B not found** → the repo is `HuggingFaceTB/SmolVLM2-2.2B-Instruct` (the
+  `smolvlm`/`smolvlm-2b` short names map to it); `HuggingFaceTB/SmolVLM-2.2B-Instruct` does
+  not exist.
 - **bitsandbytes / 4-bit errors** → drop `--load-4bit`; H100 runs 7B in fp16 fine.
 - **HF rate-limit / gated warnings** → `export HF_TOKEN=...`
 - **No internet on compute nodes** → run `scripts/prepare_data.py` on login node first.

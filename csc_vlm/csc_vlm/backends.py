@@ -190,12 +190,20 @@ class HFVLMBackend(VLMBackend):
         "qwen-7b":      "Qwen/Qwen2.5-VL-7B-Instruct",
         "qwen-3b":      "Qwen/Qwen2.5-VL-3B-Instruct",    # Qwen2.5-VL 3B
         # --- SECONDARY (independent architecture family) ---
-        "internvl":     "OpenGVLab/InternVL3-8B",          # InternVL3 8B
-        "internvl-8b":  "OpenGVLab/InternVL3-8B",
-        "internvl-2b":  "OpenGVLab/InternVL3-2B",          # InternVL3 2B
+        # Use the transformers-native "-hf" conversions. The plain OpenGVLab repos
+        # (e.g. OpenGVLab/InternVL3-8B) ship CUSTOM remote code that does NOT register
+        # with AutoModelForImageTextToText/Vision2Seq (they need AutoModel +
+        # trust_remote_code) -- that is why `internvl`/`internvl-2b` failed before.
+        # The "-hf" repos load with the standard auto-class and the shared hook.
+        "internvl":     "OpenGVLab/InternVL3-8B-hf",       # InternVL3 8B  (HF-native)
+        "internvl-8b":  "OpenGVLab/InternVL3-8B-hf",
+        "internvl-2b":  "OpenGVLab/InternVL3-2B-hf",       # InternVL3 2B  (HF-native)
         # --- SLM ARM (smallest, predicted strongest effect) ---
-        "smolvlm":      "HuggingFaceTB/SmolVLM-2.2B-Instruct",  # SmolVLM 2.2B
-        "smolvlm-2b":   "HuggingFaceTB/SmolVLM-2.2B-Instruct",
+        # There is NO "HuggingFaceTB/SmolVLM-2.2B-Instruct". The 2.2B model is
+        # SmolVLM2-2.2B-Instruct (SmolVLM-Instruct is the older 2.2B alias).
+        "smolvlm":      "HuggingFaceTB/SmolVLM2-2.2B-Instruct",  # SmolVLM2 2.2B
+        "smolvlm-2b":   "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+        "smolvlm-2.2b": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
         "smolvlm-500m": "HuggingFaceTB/SmolVLM-500M-Instruct",  # SmolVLM 500M
     }
 
@@ -309,19 +317,50 @@ class HFVLMBackend(VLMBackend):
     # Model loading
     # ------------------------------------------------------------------ #
     def _load_model(self, mid):
+        """Load any Prefix-LM VLM robustly across model families and transformers
+        versions. Tries the standard multimodal auto-classes first (works for the
+        LLaVA/Qwen/SmolVLM/InternVL "-hf" lineages), then falls back to AutoModel /
+        AutoModelForCausalLM with trust_remote_code for repos that ship custom code
+        (e.g. the non-"-hf" OpenGVLab/InternVL3 repos). Also handles the
+        `torch_dtype` -> `dtype` from_pretrained kwarg rename (transformers 4.56)."""
+        import importlib
         import torch
-        kw = dict(dtype=torch.float16, device_map="auto", trust_remote_code=True)
+        base = dict(device_map="auto", trust_remote_code=True)
         if self.cfg.load_4bit:
             from transformers import BitsAndBytesConfig
-            kw["quantization_config"] = BitsAndBytesConfig(
+            base["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
-            kw.pop("dtype", None)
-        try:
-            from transformers import AutoModelForImageTextToText
-            return AutoModelForImageTextToText.from_pretrained(mid, **kw)
-        except Exception:
-            from transformers import AutoModelForVision2Seq
-            return AutoModelForVision2Seq.from_pretrained(mid, **kw)
+            dtype_keys = [None]                 # dtype handled by the quant config
+        else:
+            dtype_keys = ["dtype", "torch_dtype"]   # name changed across versions
+
+        tfm = importlib.import_module("transformers")
+        tried = []
+        for cls_name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq",
+                         "AutoModel", "AutoModelForCausalLM"):
+            cls = getattr(tfm, cls_name, None)
+            if cls is None:
+                tried.append(f"{cls_name} (not in this transformers)")
+                continue
+            for dk in dtype_keys:
+                kw = dict(base)
+                if dk:
+                    kw[dk] = torch.float16
+                try:
+                    return cls.from_pretrained(mid, **kw)
+                except TypeError as e:
+                    if dk and "dtype" in str(e).lower():
+                        continue                # wrong dtype kwarg for this version; retry
+                    tried.append(f"{cls_name}: {str(e)[:120]}")
+                    break
+                except Exception as e:
+                    tried.append(f"{cls_name}: {type(e).__name__}: {str(e)[:120]}")
+                    break
+        raise RuntimeError(
+            f"Could not load model '{mid}' with any transformers auto-class.\nTried:\n  "
+            + "\n  ".join(t for t in tried if t)
+            + "\nHints: for InternVL use the '-hf' id (e.g. OpenGVLab/InternVL3-8B-hf); "
+            "ensure transformers>=4.49; for --load-4bit install bitsandbytes.")
 
     def read_dim(self) -> int:
         return self._d

@@ -33,8 +33,8 @@ self-check) import with numpy alone. v0.4 untouched; new p2-only file.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -224,11 +224,22 @@ class Stage0VLM:
         self.processor = self.backend.processor
         self.read_layer = self.backend.read_layer
         self._pos_id, self._neg_id = self._resolve_answer_ids()
-        # fixed, disjoint eval / monitor index splits (paired across keeps)
+        # fixed, disjoint eval / monitor index splits (paired across keeps). Clamp to
+        # the dataset size so a small dataset never yields an empty monitor set.
+        N = len(images)
+        n_eval = int(cfg.n_eval); n_mon = int(cfg.n_monitor)
+        if n_eval + n_mon > N:
+            frac_mon = n_mon / max(1, n_eval + n_mon)
+            n_mon = max(1, min(n_mon, int(round(frac_mon * N)), N - 1))
+            n_eval = max(1, N - n_mon)
+            print(f"[stage0][warn] dataset has {N} images < requested "
+                  f"{cfg.n_eval}+{cfg.n_monitor}; using n_eval={n_eval}, n_monitor={n_mon}")
         rng = np.random.default_rng(cfg.seed)
-        perm = rng.permutation(len(images))
-        self._eval_idx = perm[: cfg.n_eval]
-        self._mon_idx = perm[cfg.n_eval: cfg.n_eval + cfg.n_monitor]
+        perm = rng.permutation(N)
+        self._eval_idx = perm[:n_eval]
+        self._mon_idx = perm[n_eval:n_eval + n_mon]
+        if len(self._mon_idx) == 0:
+            raise ValueError("monitor set is empty — need more images or smaller --n-eval")
         # per-forward state read by the hook
         self._keep = 1.0; self._method = "merge"; self._span = None
         self._read_positions = None; self._fired = False; self._call_id = 0
@@ -255,7 +266,13 @@ class Stage0VLM:
                     return int(ids[0])
             return int(tok.encode(word)[0])
 
-        return first_id(self.behaviour.pos_word), first_id(self.behaviour.neg_word)
+        pos, neg = first_id(self.behaviour.pos_word), first_id(self.behaviour.neg_word)
+        if pos == neg:
+            raise ValueError(
+                f"answer words '{self.behaviour.pos_word}'/'{self.behaviour.neg_word}' "
+                f"share the same first token id ({pos}) for this tokenizer; the margin "
+                f"would always be 0. Pick distinct answer words in BEHAVIOURS for this model.")
+        return pos, neg
 
     # -- prompt build (mirrors backend._prepare but with the behaviour question) --
     def _prepare(self, image):
@@ -325,26 +342,43 @@ class Stage0VLM:
                    for m in self.backend._candidate_hook_modules()]
         self._keep = float(keep); self._method = method
         last, span, marg, corr, ys = [], [], [], [], []
+        fired_count = 0
         try:
             for call_id, i in enumerate(idx):
                 self._call_id = call_id
-                inp = self._prepare(self.images[int(i)])
-                self._span = self.backend._visual_span(inp)
-                self._read_positions = list(self._span)
-                self._fired = False
-                with torch.no_grad():
-                    out = self.model(**inp, output_hidden_states=True)
-                hs = out.hidden_states[self.read_layer][0]          # [seq, d]
-                last.append(hs[-1].float().cpu().numpy())
-                rp = self._read_positions or self._span
-                span.append(hs[rp].mean(0).float().cpu().numpy())
-                logit = out.logits[0, -1, :].float()
-                m = float(logit[self._pos_id] - logit[self._neg_id])
-                y = int(self.labels[int(i)])
+                try:
+                    inp = self._prepare(self.images[int(i)])
+                    self._span = self.backend._visual_span(inp)
+                    self._read_positions = list(self._span)
+                    self._fired = False
+                    with torch.no_grad():
+                        out = self.model(**inp, output_hidden_states=True)
+                    fired_count += int(self._fired)
+                    ri = min(self.read_layer, len(out.hidden_states) - 1)   # clamp defensively
+                    hs = out.hidden_states[ri][0]                   # [seq, d]
+                    last_i = hs[-1].float().cpu().numpy()
+                    rp = self._read_positions or self._span
+                    span_i = hs[rp].mean(0).float().cpu().numpy()
+                    logit = out.logits[0, -1, :].float()
+                    m = float(logit[self._pos_id] - logit[self._neg_id])
+                    y = int(self.labels[int(i)])
+                except Exception as e:                   # corrupt image / OOM on one sample
+                    print(f"[stage0][warn] image {int(i)} failed ({type(e).__name__}: "
+                          f"{str(e)[:120]}); skipping")
+                    continue
+                last.append(last_i); span.append(span_i)
                 marg.append(m); ys.append(y); corr.append(int((m > 0) == (y == 1)))
         finally:
             for h in handles:
                 h.remove()
+        if keep < 1.0 and fired_count == 0:
+            print(f"[stage0][warn] compression hook never fired at keep={keep} method={method} "
+                  f"— visual span not found (check image-token detection); curves will be flat.")
+        if len(last) == 0:
+            raise RuntimeError(
+                f"no images produced a read at keep={keep} method={method} — every forward "
+                f"failed. Check the model loads and runs on one sample (python run.py "
+                f"--model {self.cfg.model} --self-check).")
         return {"last": np.asarray(last), "span": np.asarray(span),
                 "margin": np.asarray(marg), "correct": np.asarray(corr),
                 "y": np.asarray(ys)}
