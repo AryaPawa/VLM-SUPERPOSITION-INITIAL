@@ -11,6 +11,11 @@ Specs
   coco_person[:/path]               safety-facing person vs no_person, built from
                                      COCO by scripts/build_person_dataset.py
                                      (defaults to data/concept)
+  coco:<category>[:/path]            presence of any COCO category (e.g. coco:cell_phone,
+                                     coco:dog), built by build_person_dataset.py
+                                     --category <name>; folders absent/ (0) present/ (1);
+                                     defaults to data/concept_<category>. Small objects give a
+                                     NON-saturating concept (cats_vs_dogs AUROC saturates).
   hf:<name>[:col=..,label=..,pos=..] HuggingFace image-classification dataset,
                                      auto-downloaded and cached. Binarised.
 
@@ -107,6 +112,21 @@ def load_images(spec: str, per_class: int = 200, smoke: bool = False,
         return make_synthetic(n=24 if smoke else 64, seed=seed)
     if spec.startswith("folder:"):
         return _load_folder(spec[len("folder:"):])
+    if spec.startswith("coco:"):
+        parts = spec.split(":")
+        cat = parts[1]
+        root = parts[2] if len(parts) > 2 and parts[2] else f"data/concept_{cat}"
+        if not os.path.isdir(root):
+            raise ValueError(f"coco:{cat} dataset not found at '{root}'. Build it first:\n"
+                             f"  python scripts/build_person_dataset.py --download --category "
+                             f"{cat.replace('_', ' ')!r} --output {root}")
+        imgs, y = _load_folder(root)             # sorted classes: absent=0, present=1
+        pc = 24 if smoke else per_class
+        rng = np.random.default_rng(seed)
+        sel = np.concatenate([rng.choice(np.where(y == c)[0], size=min(pc, int((y == c).sum())),
+                                         replace=False) for c in (0, 1)])
+        rng.shuffle(sel)
+        return [imgs[int(i)] for i in sel], y[sel]
     if spec.startswith("coco_person"):
         # Safety-facing concept: person vs no_person ImageFolder built from COCO
         # by scripts/build_person_dataset.py. `coco_person` -> data/concept;

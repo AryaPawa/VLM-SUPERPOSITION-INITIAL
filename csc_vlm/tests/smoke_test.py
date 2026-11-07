@@ -1,8 +1,11 @@
 """
 tests/smoke_test.py  --  fast CPU smoke test (no GPU, no torch, no network).
 
-Verifies the pipeline end-to-end on the mock backend and that all three analysis
-harnesses (X1 toy, Stage 0, Stage 1) pass their self-checks. This is the test the
+Verifies the legacy grid pipeline on the mock backend and that the analysis
+harnesses (X1 toy, X1b trained toy, Stage 0 v2, Stage 1 v2) pass their self-checks.
+The real-model-class tests (tiny random LLaVA / Qwen2.5-VL, needs torch +
+transformers) live in tests/test_pipeline_v2.py; run everything with
+    python -m pytest tests/ -v This is the test the
 README points at:
 
     python -m pytest tests/smoke_test.py -v
@@ -49,6 +52,13 @@ def test_x1_toy(tmp_path):
     rc, log = _run([os.path.join(SCRIPTS, "run_x1_toy.py")], cwd=str(tmp_path))
     assert rc == 0, f"x1 toy exited {rc}\n{log}"
     assert "FAIL" not in log, f"an X1 check FAILed\n{log}"
+
+
+def test_x1b_trained_toy_selfcheck(tmp_path):
+    """X1b: manual backprop == finite differences; closed-form OC == min-norm solve."""
+    rc, log = _run([os.path.join(SCRIPTS, "run_x1b_toy.py"), "--self-check"], cwd=str(tmp_path))
+    assert rc == 0, f"x1b self-check exited {rc}\n{log}"
+    assert "PASS" in log, f"x1b self-check did not pass\n{log}"
 
 
 def test_stage0_selfcheck(tmp_path):

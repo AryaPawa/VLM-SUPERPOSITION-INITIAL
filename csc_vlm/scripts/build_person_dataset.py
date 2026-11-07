@@ -79,7 +79,8 @@ def download_coco(coco_root: Path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Build person/no_person from COCO")
+    ap = argparse.ArgumentParser(description="Build a COCO concept-presence ImageFolder "
+                                             "(person/no_person by default, or any --category)")
     ap.add_argument("--download", action="store_true",
                     help="fetch COCO val2017 + annotations into --coco-root if missing")
     ap.add_argument("--coco-root", default="coco_download",
@@ -88,8 +89,11 @@ def main():
                     help="images dir (default: <coco-root>/val2017)")
     ap.add_argument("--coco-ann", default="",
                     help="instances json (default: <coco-root>/annotations/instances_val2017.json)")
-    ap.add_argument("--output", default="data/concept",
-                    help="output dir (gets person/ and no_person/ subfolders)")
+    ap.add_argument("--output", default="",
+                    help="output dir (default data/concept for person, data/concept_<cat> otherwise)")
+    ap.add_argument("--category", default="person",
+                    help="COCO category name, e.g. 'person', 'cell phone', 'dog'. Non-person "
+                         "categories are written as absent/ and present/ (labels 0/1)")
     ap.add_argument("--max-per-class", type=int, default=500)
     ap.add_argument("--symlink", action="store_true",
                     help="symlink instead of copying (Linux; copy is the default)")
@@ -121,12 +125,14 @@ def main():
     all_image_ids = set(id_to_file.keys())
     print(f"  Total images in annotation file: {len(all_image_ids)}")
 
-    # ---- person category id ---------------------------------------------- #
+    # ---- category id ----------------------------------------------------- #
+    cat_name = args.category.strip()
     person_cat_id = next((c["id"] for c in coco["categories"]
-                          if c["name"] == "person"), None)
+                          if c["name"] == cat_name), None)
     if person_cat_id is None:
-        raise ValueError("Could not find 'person' category in COCO annotations!")
-    print(f"  Person category ID: {person_cat_id}")
+        names = sorted(c["name"] for c in coco["categories"])
+        raise ValueError(f"Could not find category {cat_name!r}. Available: {names}")
+    print(f"  Category {cat_name!r} ID: {person_cat_id}")
 
     # ---- split by person presence ---------------------------------------- #
     person_ids = {a["image_id"] for a in coco["annotations"]
@@ -141,9 +147,11 @@ def main():
     no_person_sel = sorted(no_person_ids)[:n]
 
     # ---- place files ------------------------------------------------------ #
-    out = Path(args.output)
-    person_dir = out / "person"
-    no_person_dir = out / "no_person"
+    is_person = cat_name == "person"
+    out = Path(args.output or ("data/concept" if is_person
+                               else f"data/concept_{cat_name.replace(' ', '_')}"))
+    person_dir = out / ("person" if is_person else "present")
+    no_person_dir = out / ("no_person" if is_person else "absent")
     person_dir.mkdir(parents=True, exist_ok=True)
     no_person_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,11 +176,13 @@ def main():
 
     print("\nDone!")
     print(f"  Placed: {p1 + p0} images  (missing on disk: {m1 + m0})")
-    print(f"  person/    : {len(list(person_dir.iterdir()))} images")
-    print(f"  no_person/ : {len(list(no_person_dir.iterdir()))} images")
+    print(f"  {person_dir.name}/ : {len(list(person_dir.iterdir()))} images")
+    print(f"  {no_person_dir.name}/ : {len(list(no_person_dir.iterdir()))} images")
     print(f"\nOutput: {out}")
-    print(f"Use with:  --dataset folder:{out}   (or  --dataset coco_person"
-          f"{'' if str(out) == 'data/concept' else ':' + str(out)})")
+    if is_person:
+        print(f"Use with:  --dataset coco_person{'' if str(out) == 'data/concept' else ':' + str(out)}")
+    else:
+        print(f"Use with:  --dataset coco:{cat_name.replace(' ', '_')}:{out}")
 
 
 if __name__ == "__main__":

@@ -6,8 +6,11 @@ test_qwen_local.py
 runs/
 runs_stage0/
 runs_stage1/
+runs_preflight/
 toy_x1.png
 toy_x1_results.json
+toy_x1b.png
+toy_x1b_results.json
 
 # Results directories
 result_full/
