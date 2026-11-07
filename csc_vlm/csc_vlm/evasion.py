@@ -52,6 +52,25 @@ No gradient masking here: the selection (drop_*) happens BEFORE the leaf, so the
 attacker's mask is frozen (review X4 arm B). Masking is a pixel-space (Stage 2)
 issue.
 
+Monitors and nulls added for the cluster run (v2.1)
+---------------------------------------------------
+  * CANONICAL rank-1 probe = the class-mean-difference axis u0 (first basis
+    column) with the midpoint threshold. It is the HEADLINE (R["summary"], r=1):
+    no rank or PC choice to defend. r = r_max is reported alongside
+    (R["summary_rmax"]); every capture is nested, so any r can be re-analysed.
+  * Full-capacity (Mahalanobis-optimal) read-space detector: the minimal
+    whitened move that flips b is |b| / sqrt(c^T Sigma c). Logged as c_var and
+    analysed as log_full = log m - 0.5 log c^T Sigma c. If this slope is ~0 while
+    log T moves, the effect is about WHICH monitor, not about detectability.
+  * Incidental detection: does the canonical probe flag the PLAIN (monitor-
+    unaware) minimal attack delta_unc = -1.25 b g/||g||^2? First order on every
+    image (probe.detected_fo), and in the true model on n_check images
+    (check.unc_probe_flipped).
+  * Read-path pullback J^T c (cap_readpath) and matched placebo (cap_match:
+    same monitored component as c, random unmonitored part of the same norm):
+      A = [A - A_readpath] + [A_readpath - A_match] + A_match
+          (bypass)          (behaviour-specific)     (generic coverage)
+
 First-order validity (cheap preview of the Stage-2 gate): on ``n_check`` images
 per cell we apply the first-order minimal evading perturbation
 delta = -b * P_perp g / ||P_perp g||^2 (scaled by 1.25) in the TRUE model and
@@ -146,7 +165,9 @@ def run_stage1(collector, keeps=DEFAULT_KEEPS, methods=METHODS, r_max: int = 8,
                 cap8 = float(np.median([r["cap_in"][min(r_max, len(r["cap_in"])) - 1] for r in ok])) if ok else float("nan")
                 print(f"[stage1] {method:11s} keep={keep:.4f} n={len(ok)} |b|={med('m'):.3f} "
                       f"||g||={math.sqrt(max(med('gn2'), 0)):.3g} cap@{r_max}={cap8:.4f}", flush=True)
-    R["summary"] = analyze_stage1(R)
+    # headline = the CANONICAL rank-1 probe (no rank / PC choices); r_max shown alongside
+    R["summary"] = analyze_stage1(R, r=1)
+    R["summary_rmax"] = analyze_stage1(R, r=r_max) if r_max > 1 else R["summary"]
     return R
 
 
@@ -155,34 +176,56 @@ def _nanmed(vals) -> float:
     return float(np.nanmedian(a)) if np.isfinite(a).any() else float("nan")
 
 
+def _cap_at(v, r: int) -> Optional[float]:
+    """Capture at rank r from a nested list (or a legacy scalar = top rank)."""
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        return float(v[min(r, len(v)) - 1])
+    return float(v)
+
+
+def _A(cap: Optional[float]) -> float:
+    return float("nan") if cap is None else -math.log(float(np.clip(cap, 1e-12, 1.0)))
+
+
 def _derived(rec: Dict, r: int) -> Dict:
-    cap = float(np.clip(rec["cap_in"][r - 1], 1e-12, 1 - 1e-12))
+    cap = float(np.clip(_cap_at(rec["cap_in"], r), 1e-12, 1 - 1e-12))
     out = {"log_m": math.log(rec["m"] + 1e-12),
            "neg_log_g": -0.5 * math.log(rec["gn2"] + 1e-30),
            "log_T": -0.5 * math.log(1.0 - cap),
            "A": -math.log(cap)}
     out["log_oc"] = out["log_m"] + out["neg_log_g"] + out["log_T"]
-    for key in ("cap_pl_out", "cap_pl_read", "cap_frozen"):
-        if key in rec and rec[key] is not None:
-            out["A_" + key[4:]] = -math.log(float(np.clip(rec[key], 1e-12, 1.0)))
+    for key in ("cap_pl_out", "cap_pl_read", "cap_frozen", "cap_readpath", "cap_match"):
+        if rec.get(key) is not None:
+            out["A_" + key[4:]] = _A(_cap_at(rec[key], r))
     if rec.get("cap_read"):
         rr = rec["read_ranks"]
         if r in rr:
-            out["A_read"] = -math.log(float(np.clip(rec["cap_read"][rr.index(r)], 1e-12, 1.0)))
+            out["A_read"] = _A(rec["cap_read"][rr.index(r)])
+    if rec.get("c_var") and rec["c_var"] > 0:
+        # full-capacity detector: margin in units of the natural spread of the behaviour logit
+        out["log_full"] = math.log(rec["m"] + 1e-12) - 0.5 * math.log(rec["c_var"])
+    if rec.get("c_norm"):
+        out["log_read_robust"] = math.log(rec["m"] + 1e-12) - math.log(rec["c_norm"] + 1e-30)
     return out
 
 
+_SLOPE_KEYS = ("A", "A_match", "A_pl_out", "A_pl_read", "A_readpath", "A_frozen", "A_read",
+               "log_full", "log_read_robust")
+
+
 def analyze_stage1(R: Dict, r: Optional[int] = None, B: int = 2000) -> Dict:
-    """Paired (within-image) slopes vs log keep with cluster-bootstrap CIs, the
-    exact signed decomposition of log OC, the placebo contrasts, and the
-    per-keep rank curves. Every verdict is two-sided."""
+    """Paired (within-image) slopes vs log(actual kept fraction) with cluster-bootstrap
+    CIs, the exact signed decomposition of log OC at monitor rank r, placebo contrasts,
+    the full-capacity detector, incidental detection, and per-keep curves. All
+    verdicts are two-sided."""
     r = int(r or R["r_max"])
     S: Dict = {"r": r, "methods": {}}
     for method in R["methods"]:
         recs = [x for x in R["per_image"] if x["method"] == method and x.get("ok")]
         if not recs:
             continue
-        # x = log of the ACTUAL kept fraction (pool's 2-D rounding differs from the nominal keep)
         x = np.array([math.log(z["n_carriers"] / z["n_visual"]) if z.get("n_visual") else math.log(z["keep"])
                       for z in recs])
         g = np.array([z["image"] for z in recs])
@@ -190,14 +233,22 @@ def analyze_stage1(R: Dict, r: Optional[int] = None, B: int = 2000) -> Dict:
         col = lambda k: np.array([d.get(k, np.nan) for d in D], float)
         dec = st.decompose(x, {"log_oc": col("log_oc"), "log_m": col("log_m"),
                                "neg_log_g": col("neg_log_g"), "log_T": col("log_T")}, g, B=B)
-        sl = {k: st.paired_slope(x, col(k), g, B=B) for k in
-              ("A", "A_pl_out", "A_pl_read", "A_frozen", "A_read")
-              if np.isfinite(col(k)).any()}
+        sl = {k: st.paired_slope(x, col(k), g, B=B) for k in _SLOPE_KEYS if np.isfinite(col(k)).any()}
         diffs = {}
-        for pk in ("A_pl_out", "A_pl_read"):
+        # A - A_x for every null. The cleanest split of the real slope is
+        #   A = [A - A_readpath]  (bypass channels: paths the last-token read cannot see)
+        #     + [A_readpath - A_match]  (specificity: both are pullbacks of read directions with
+        #                                the SAME read-space capture at every r <= r_max, so no
+        #                                ceiling/floor asymmetry)
+        #     + A_match  (generic coverage geometry)
+        for pk in ("A_match", "A_pl_out", "A_pl_read"):
             if pk in sl:
                 diffs["A_minus_" + pk[2:]] = st.paired_slope_diff(x, col("A"), col(pk), g, B=B)
-        # per-keep medians and rank curves
+        if "A_readpath" in sl:
+            diffs["bypass(A - A_readpath)"] = st.paired_slope_diff(x, col("A"), col("A_readpath"), g, B=B)
+            if "A_match" in sl:
+                diffs["specific(A_readpath - A_match)"] = st.paired_slope_diff(
+                    x, col("A_readpath"), col("A_match"), g, B=B)
         rows = []
         for keep in R["keeps"]:
             cell = [z for z in recs if abs(z["keep"] - keep) < 1e-12]
@@ -205,10 +256,11 @@ def analyze_stage1(R: Dict, r: Optional[int] = None, B: int = 2000) -> Dict:
                 continue
             Dk = [_derived(z, r) for z in cell]
             capin = np.array([z["cap_in"] for z in cell])
+            ri = min(r, capin.shape[1]) - 1
             row = {"keep": keep, "n": len(cell),
                    "m": float(np.median([z["m"] for z in cell])),
                    "g": float(np.median([math.sqrt(z["gn2"]) for z in cell])),
-                   "Gamma": float(np.median([math.sqrt(1 - min(z["cap_in"][r - 1], 1 - 1e-12)) for z in cell])),
+                   "Gamma": float(np.median([math.sqrt(1 - min(z["cap_in"][ri], 1 - 1e-12)) for z in cell])),
                    "T": float(np.median([math.exp(d["log_T"]) for d in Dk])),
                    "OC": float(np.median([math.exp(d["log_oc"]) for d in Dk])),
                    "OC_rel": float(np.median([math.exp(d["log_oc"]) / (z["carrier_fro"] + 1e-12)
@@ -216,8 +268,16 @@ def analyze_stage1(R: Dict, r: Optional[int] = None, B: int = 2000) -> Dict:
                    "accuracy": float(np.mean([z["correct"] for z in cell])),
                    "n_carriers": float(np.median([z["n_carriers"] for z in cell])),
                    "cap_in_curve": np.median(capin, 0).tolist(),
-                   "cap_pl_out": _nanmed([z.get("cap_pl_out") for z in cell]),
-                   "cap_pl_read": _nanmed([z.get("cap_pl_read") for z in cell])}
+                   "cap": float(np.median(capin[:, ri])),
+                   "cap_match": _nanmed([_cap_at(z.get("cap_match"), r) for z in cell]),
+                   "cap_readpath": _nanmed([_cap_at(z.get("cap_readpath"), r) for z in cell]),
+                   "cap_pl_out": _nanmed([_cap_at(z.get("cap_pl_out"), r) for z in cell]),
+                   "cap_pl_read": _nanmed([_cap_at(z.get("cap_pl_read"), r) for z in cell]),
+                   "full_cost": _nanmed([math.exp(d["log_full"]) if "log_full" in d else None for d in Dk])}
+            pr = [z["probe"] for z in cell if z.get("probe")]
+            if pr:
+                row["incidental_detect_fo"] = float(np.mean([p["detected_fo"] for p in pr]))
+                row["probe_shift_rel"] = float(np.median([p["shift_rel"] for p in pr]))
             if cell[0].get("cap_read"):
                 cr = np.array([z["cap_read"] for z in cell])
                 row["cap_read_curve"] = np.median(cr, 0).tolist()
@@ -229,6 +289,10 @@ def analyze_stage1(R: Dict, r: Optional[int] = None, B: int = 2000) -> Dict:
                 row["check_flip_rate"] = float(np.mean([z["check"]["flipped"] for z in chk]))
                 row["check_monitor_drift"] = float(np.median([z["check"]["monitor_drift"] for z in chk]))
                 row["check_b_ratio"] = float(np.median([z["check"]["b_ratio"] for z in chk]))
+                unc = [z["check"] for z in chk if "unc_flipped" in z["check"]]
+                if unc:
+                    row["unc_flip_rate"] = float(np.mean([c["unc_flipped"] for c in unc]))
+                    row["unc_probe_detect"] = float(np.mean([c["unc_probe_flipped"] for c in unc]))
             rows.append(row)
         S["methods"][method] = {"decomposition": dec, "slopes": sl, "placebo_diffs": diffs,
                                 "rows": rows}
@@ -236,10 +300,12 @@ def analyze_stage1(R: Dict, r: Optional[int] = None, B: int = 2000) -> Dict:
 
 
 def format_stage1(S: Dict) -> str:
-    L = [f"Stage 1 v2 summary (monitor rank r={S['r']}; slopes beta = d log X / d log(actual kept "
-         "fraction), so beta>0 means X falls under compression)"]
+    r = S["r"]
+    L = [f"Stage 1 v2 summary -- monitor rank r={r}"
+         + ("  (CANONICAL rank-1 probe)" if r == 1 else "")
+         + "\n  beta = d log X / d log(actual kept fraction); beta>0 means X FALLS under compression"]
     for method, M in S["methods"].items():
-        d = M["decomposition"]
+        d, sl = M["decomposition"], M["slopes"]
         L.append(f"\n[{method}]")
         L.append("  " + st.describe_slope("log OC (total)", d["log_oc"],
                                           "OC FALLS with compression (cheaper hidden attack)",
@@ -254,22 +320,28 @@ def format_stage1(S: Dict) -> str:
         c = d.get("contribution", {})
         L.append(f"  signed shares of the log-OC slope: m {c.get('log_m', float('nan')):+.2f}, "
                  f"robust {c.get('neg_log_g', float('nan')):+.2f}, tax {c.get('log_T', float('nan')):+.2f}"
-                 f"  (exact recon err {d.get('recon_error', float('nan')):.1e})")
-        for k, v in M["slopes"].items():
-            L.append("  " + st.describe_slope(f"{k} (log-alignment)", v,
-                                              "alignment RISES with compression",
-                                              "alignment FALLS with compression (monitor sees less)"))
+                 f"  (exact recon err {d.get('recon_error', float('nan')):.1e}; shares explode if total ~ 0)")
+        if "log_full" in sl:
+            L.append("  " + st.describe_slope("full-capacity detector cost", sl["log_full"],
+                                              "falls (even an optimal detector loses ground)",
+                                              "rises"))
+        for k in ("A", "A_match", "A_readpath", "A_frozen", "A_read", "A_pl_out", "A_pl_read"):
+            if k in sl:
+                L.append("  " + st.describe_slope(f"{k} (log-alignment)", sl[k],
+                                                  "monitor sees MORE under compression",
+                                                  "monitor sees LESS under compression"))
         for k, v in M["placebo_diffs"].items():
-            L.append("  " + st.describe_slope(f"{k}", v,
-                                              "behaviour-specific: monitor sees MORE than placebo trend",
-                                              "behaviour-specific: monitor sees LESS than placebo trend"))
-        L.append("   keep   n   |b|     ||g||     Gamma    T      OC      acc   carriers  "
-                 "rank2audit(read)  flip/drift")
-        for r in M["rows"]:
-            L.append(f"  {r['keep']:.4f} {r['n']:3d} {r['m']:7.3f} {r['g']:9.3g} {r['Gamma']:7.4f} "
-                     f"{r['T']:6.3f} {r['OC']:8.3g} {r['accuracy']:5.2f} {r['n_carriers']:8.0f}  "
-                     f"{str(r.get('rank_to_audit_T2_read')):>8s}        "
-                     f"{r.get('check_flip_rate', float('nan')):.2f}/{r.get('check_monitor_drift', float('nan')):.3f}")
+            L.append("  " + st.describe_slope(k, v, "real: monitor sees MORE than this null",
+                                              "real: monitor sees LESS than this null"))
+        L.append("   keep    n   |b|    ||g||   cap    capMatch  T      OC      acc  carr  "
+                 "r2audit  incidental  flip/drift  unc_flip/probe")
+        for w in M["rows"]:
+            L.append(f"  {w['keep']:.4f} {w['n']:3d} {w['m']:6.3f} {w['g']:8.3g} {w['cap']:6.3f}  "
+                     f"{w['cap_match']:6.3f}  {w['T']:6.3f} {w['OC']:8.3g} {w['accuracy']:4.2f} "
+                     f"{w['n_carriers']:5.0f}  {str(w.get('rank_to_audit_T2_read')):>6s}   "
+                     f"{w.get('incidental_detect_fo', float('nan')):5.2f}      "
+                     f"{w.get('check_flip_rate', float('nan')):.2f}/{w.get('check_monitor_drift', float('nan')):.3f}  "
+                     f"{w.get('unc_flip_rate', float('nan')):.2f}/{w.get('unc_probe_detect', float('nan')):.2f}")
     return "\n".join(L)
 
 
@@ -323,6 +395,11 @@ class Stage1VLM:
                                            int(min(r_frozen, m0["ok"].sum() - 1)))
         mu1, mu0 = H[y == 1].mean(0), H[y == 0].mean(0)
         self.gap = float(np.linalg.norm(mu1 - mu0)) + EPS
+        # canonical rank-1 probe = class-mean-difference axis u0 (first basis column) with the
+        # midpoint threshold; and centred reads for the full-capacity (Mahalanobis-optimal) cost
+        u0 = self.U_refit[:, 0]
+        self.probe_tau = float(u0 @ (0.5 * (mu1 + mu0)))
+        self.Hc = (H - H.mean(0, keepdims=True)).astype(np.float64)
         from .stage0 import coverage_curve
         cov = coverage_curve(H)
         return {"basis_rank": rb, "class_gap": self.gap, "cov_r90": cov["r90"], "cov_top8": cov["top8"]}
@@ -366,12 +443,29 @@ class Stage1VLM:
                 fr.append(gj if gj is not None else torch.zeros_like(gb))
             Gf = torch.stack(fr, 0)
         g_pr = self._grad((self.c_rand * hlast).sum(), v)
+        g_rp = g_mt = None
+        if c is not None:
+            cdet = c.detach()
+            # (i) read-path pullback J^T c: the behaviour's sensitivity THROUGH the monitored read
+            #     only. g_b - J^T c are bypass channels (other positions / later layers) that a
+            #     last-token monitor cannot see.
+            g_rp = self._grad((cdet * hlast).sum(), v)
+            # (ii) matched placebo: same monitored component as c, random unmonitored component
+            #      of the same norm. Starts at the SAME read-space capture as the behaviour, so the
+            #      real-vs-placebo comparison has no ceiling/floor asymmetry.
+            pc = Ur @ (Ur.T @ cdet)
+            gen = torch.Generator(device="cpu").manual_seed(int(i) * 7919 + 17)
+            w = torch.randn(cdet.shape[0], generator=gen).to(cdet.device, cdet.dtype)
+            w = w - Ur @ (Ur.T @ w)
+            w = w / (w.norm() + 1e-30) * (cdet - pc).norm()
+            g_mt = self._grad(((pc + w) * hlast).sum(), v)
         a, cc = self.placebo_pair
         g_po = self._grad(logits[a] - logits[cc], v, retain=False)
         # ---- small Gram algebra in float64 on CPU ----
         K = (G @ G.T).double().cpu().numpy()
         gn2 = float((gb @ gb).double())
-        cap_in = nested_capture(K, (G @ gb).double().cpu().numpy(), gn2)
+        zb = (G @ gb).double().cpu().numpy()
+        cap_in = nested_capture(K, zb, gn2)
         rec = {"image": int(i), "ok": True, "b": float(b.detach()), "m": abs(float(b.detach())),
                "gn2": gn2, "cap_in": cap_in.tolist(), "y": int(s0.labels[int(i)]),
                "correct": int((float(b.detach()) > 0) == (int(s0.labels[int(i)]) == 1)),
@@ -379,15 +473,28 @@ class Stage1VLM:
                "carrier_fro": float(v.detach().float().norm()),
                "read_ranks": list(read_ranks)}
         rP = min(r_max, G.shape[0])
-        for name, gp in (("cap_pl_read", g_pr), ("cap_pl_out", g_po)):
+        # every capture below is NESTED (index r-1 = rank r), so any rank can be analysed later
+        for name, gp in (("cap_pl_read", g_pr), ("cap_pl_out", g_po), ("cap_readpath", g_rp),
+                         ("cap_match", g_mt)):
             if gp is None or float(gp @ gp) <= 0:
                 rec[name] = None
                 continue
-            cp = nested_capture(K[:rP, :rP], (G[:rP] @ gp).double().cpu().numpy(), float((gp @ gp).double()))
-            rec[name] = float(cp[-1])
+            rec[name] = nested_capture(K, (G @ gp).double().cpu().numpy(),
+                                       float((gp @ gp).double())).tolist()
+        if g_rp is not None:
+            rec["gn2_readpath"] = float((g_rp @ g_rp).double())
         if Gf is not None:
             Kf = (Gf @ Gf.T).double().cpu().numpy()
-            rec["cap_frozen"] = float(nested_capture(Kf, (Gf @ gb).double().cpu().numpy(), gn2)[-1])
+            rec["cap_frozen"] = nested_capture(Kf, (Gf @ gb).double().cpu().numpy(), gn2).tolist()
+        # canonical rank-1 probe score, and the first-order INCIDENTAL detection of the plain
+        # (monitor-unaware) minimal attack delta_unc = -1.25 b g / ||g||^2: does the probe's
+        # decision flip along with the answer?
+        bb0 = float(b.detach())
+        s_probe = float(np.dot(self.U_refit[:, 0], hlast.detach().double().cpu().numpy()))
+        ds_unc = -1.25 * bb0 * float(zb[0]) / max(gn2, 1e-30)
+        rec["probe"] = {"s": s_probe, "tau": self.probe_tau, "ds_unc": ds_unc,
+                        "detected_fo": bool((s_probe > self.probe_tau) != (s_probe + ds_unc > self.probe_tau)),
+                        "shift_rel": abs(ds_unc) / self.gap}
         if c is not None:
             cn = c.double().cpu().numpy()
             cn2 = float(cn @ cn)
@@ -395,6 +502,12 @@ class Stage1VLM:
             rec["cap_read"] = [float(np.sum(proj[:min(rk, len(proj))] ** 2) / max(cn2, 1e-30))
                                for rk in read_ranks]
             rec["c_norm"] = math.sqrt(cn2)
+            # full-capacity (Mahalanobis-optimal) detector cost in read space: the minimal
+            # whitened move that flips b is |b| / sqrt(c^T Sigma c) -- "margin in units of the
+            # natural spread of the behaviour logit". Needs only Sigma (no inverse), and the
+            # quadratic form of a fixed c is unbiased for n < d.
+            Hc = self.Hc
+            rec["c_var"] = float(np.sum((Hc @ cn) ** 2) / max(1, Hc.shape[0] - 1))
         # ---- first-order validity check in the true model ----
         if do_check and gn2 > 0:
             with torch.no_grad():
@@ -418,6 +531,17 @@ class Stage1VLM:
                     rec["check"] = {"b_before": bb, "b_after": b2, "b_ratio": b2 / (bb + 1e-12),
                                     "flipped": bool(np.sign(b2) != np.sign(bb)),
                                     "monitor_drift": drift, "delta_norm": math.sqrt(float(delta @ delta))}
+                    # plain attack (no monitor term): does the canonical probe flag it in the true model?
+                    du = (-1.25 * bb / gn2) * gb.double()
+                    o3 = h.compressed_run(inp, mth, keep, scores=sc, image_key=int(i),
+                                          seed=s0.cfg.seed, capture=(rl,),
+                                          carriers_override=(v.detach().double() + du.view_as(v)).to(v.dtype))
+                    b3 = float(torch.logsumexp(o3["logits"][s0.pos_ids], 0)
+                               - torch.logsumexp(o3["logits"][s0.neg_ids], 0)) * (-1 if s0.polarity_flipped else 1)
+                    s3 = float(np.dot(self.U_refit[:, 0], o3["hs"][rl][-1].double().cpu().numpy()))
+                    rec["check"].update({"unc_flipped": bool(np.sign(b3) != np.sign(bb)),
+                                         "unc_probe_flipped": bool((s3 > self.probe_tau) != (s_probe > self.probe_tau)),
+                                         "unc_delta_norm": math.sqrt(float(du @ du))})
         return rec
 
     def per_image(self, keep, method, n_images, r_max, r_frozen, read_ranks, staleness, n_check):
@@ -475,11 +599,24 @@ class Stage1Mock:
                 m = math.exp(0.2 * off) * keep ** 0.6 * (1 + 0.05 * rng.normal())
             cap *= math.exp(0.05 * rng.normal())
             curve = [min(0.99, cap * (r / self.R) ** 0.5) for r in range(1, self.R + 1)]
-            out.append({"image": i, "ok": True, "b": m, "m": m, "gn2": 4.0 * math.exp(0.1 * rng.normal()),
-                        "cap_in": curve, "cap_pl_out": 0.02 * math.exp(0.05 * rng.normal()),
-                        "cap_pl_read": 0.01 * math.exp(0.05 * rng.normal()),
-                        "cap_frozen": curve[-1] * 0.9, "y": i % 2, "correct": 1,
-                        "n_carriers": int(64 * keep), "carrier_fro": 10.0,
-                        "read_ranks": list(read_ranks),
-                        "cap_read": [min(0.99, curve[-1] * (rk / self.R) ** 0.5) for rk in read_ranks]})
+            # matched placebo: starts at the behaviour's keep=1 capture, then stays flat
+            mcurve = [min(0.99, base_cap * (r / self.R) ** 0.5 * math.exp(0.05 * rng.normal()))
+                      for r in range(1, self.R + 1)]
+            nest = lambda c0: [c0 * (r / self.R) ** 0.5 for r in range(1, self.R + 1)]
+            s_pr = 0.5 * (1 if i % 2 else -1) + 0.1 * rng.normal()
+            rec = {"image": i, "ok": True, "b": m, "m": m, "gn2": 4.0 * math.exp(0.1 * rng.normal()),
+                   "cap_in": curve, "cap_readpath": list(curve), "cap_match": mcurve,
+                   "cap_pl_out": nest(0.02 * math.exp(0.05 * rng.normal())),
+                   "cap_pl_read": nest(0.01 * math.exp(0.05 * rng.normal())),
+                   "cap_frozen": [0.9 * c_ for c_ in curve], "y": i % 2, "correct": 1,
+                   "n_carriers": max(1, int(64 * keep)), "n_visual": 64, "carrier_fro": 10.0,
+                   "read_ranks": list(read_ranks), "c_norm": 1.0, "c_var": 0.25,
+                   "probe": {"s": s_pr, "tau": 0.0, "ds_unc": -0.2 * s_pr,
+                             "detected_fo": False, "shift_rel": 0.2},
+                   "cap_read": [min(0.99, curve[-1] * (rk / self.R) ** 0.5) for rk in read_ranks]}
+            if i < n_check:
+                rec["check"] = {"b_before": m, "b_after": -0.25 * m, "b_ratio": -0.25, "flipped": True,
+                                "monitor_drift": 0.01, "delta_norm": 1.0, "unc_flipped": True,
+                                "unc_probe_flipped": False, "unc_delta_norm": 0.5}
+            out.append(rec)
         return out

@@ -99,21 +99,40 @@ run the preflight first and skip any model that fails it. Edit `MODELS` and
 * `cov_top8` > 0.8 → coverage regime: a rank-8 monitor already spans most of the
   read. Read the Stage-1 Γ(r) curves, not one rank (Problem D).
 
-**Stage 1** (per method). The headline is `log T` and `A_minus_pl_out`:
+**Stage 1** (per method). Two summaries are printed: **r = 1, the canonical
+rank-1 probe** (class-mean-difference axis, midpoint threshold; the headline —
+no rank or PC choice to defend) and r = r_max (robustness). Re-analyse any rank
+offline with `scripts/analyze_stage1.py`. The alignment slope splits exactly as
 
-| outcome | meaning | next |
+  `A = bypass(A − A_readpath) + specific(A_readpath − A_match) + A_match`
+
+* `A_match` (matched placebo: same monitored component as the behaviour's read
+  gradient, random unmonitored part) is the **generic coverage** null with no
+  ceiling/floor asymmetry. Use it, not `A_pl_out`/`A_pl_read`, for specificity.
+* `bypass` = paths the last-token read cannot see (other positions, later layers).
+* `full-capacity detector cost` = |b|/sqrt(cᵀΣc): an optimal read-space detector.
+* `incidental` = fraction of images where the canonical probe flags the
+  **plain** (monitor-unaware) minimal attack; `unc_flip/probe` = the same in the
+  true model on n_check images.
+
+| outcome (r = 1, CIs) | meaning | next |
 |---|---|---|
-| log T beta > 0 (CI) **and** A−placebo beta < 0 (CI) | compression lowers the monitor's tax beyond what geometry predicts | build Stage 2 (pixel PGD + gradient-free) for this method |
-| log T beta < 0 but A−placebo beta < 0 | coverage dominates the net; there is a behaviour-specific erosion underneath | claim it at **fixed coverage** (rank-to-audit), not at fixed r |
-| log T ≈ 0 and A−placebo ≈ 0, OC moved by m or ‖g‖ | no auditability effect; this is a robustness / info-loss result | mentor decision: reframe as a robustness paper |
-| T ≈ 1 at all keeps | a rank-r linear probe imposes no tax even uncompressed | use stronger or higher-rank monitors before any claim |
+| log T β > 0 **and** `specific` β < 0 | compression lowers the tax beyond coverage geometry | build Stage 2 (pixel PGD + gradient-free) for this method |
+| log T β > 0, `specific` ≈ 0, `bypass` β < 0 | the behaviour moves into channels the last-token monitor cannot read | claim is about **where** monitors read; test multi-position/later-layer monitors |
+| log T β < 0, `specific` β < 0 | coverage dominates the net; behaviour-specific erosion underneath | claim it at **fixed coverage** (rank-to-audit), not at fixed r |
+| log T and full-capacity cost both ≈ 0, OC moved by m or ‖g‖ | no auditability effect; robustness / info-loss result | mentor decision: reframe as a robustness paper |
+| log T moves but full-capacity cost ≈ 0 | the effect is about **which** monitor, not detectability itself | report as a monitor-choice result |
+| incidental ≈ 1 and stays ≈ 1 | the plain attack is already caught: evasion needs the monitor-aware attack | headline the monitor-aware OC |
+| T ≈ 1 at all keeps | a linear probe imposes no tax even uncompressed | use stronger or higher-rank monitors before any claim |
 | `flip/drift` ≠ ~1.00 / ≪1 | first-order OC is not realised in the true model | Stage 2 is required before any OC number |
 
 Also compare `merge_dup` with `pool` (information bottleneck vs carrier count),
 and `drop_random` with `drop_norm` (G1).
 
-**X1b toy:** the sign of `log T` and of `A − A_placebo` in each regime is the
-regime map that the VLM numbers should be compared against.
+**X1b toy:** run the full 3-seed sweep (`python scripts/run_x1b_toy.py`, ~5 min).
+Regimes `carrier_bottleneck` and `subtle_behaviour`; ranks 1, 2, 4. Trust a sign
+only if `[seeds n/n]` agree. The signs of `log T`, `A − A_matched` and the
+full-capacity cost per regime are the map the VLM numbers are compared against.
 
 ---
 

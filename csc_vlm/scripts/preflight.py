@@ -34,6 +34,8 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from csc_vlm._io import utf8_stdio  # noqa: E402
+utf8_stdio()
 
 
 def main():
@@ -151,7 +153,7 @@ def main():
         v = o["leaf"]
         bb = torch.logsumexp(o["logits"][s0.pos_ids], 0) - torch.logsumexp(o["logits"][s0.neg_ids], 0)
         g = torch.autograd.grad(bb, v, retain_graph=True)[0]
-        for _ in range(17):        # time a full Stage-1 image (1 + 8 + 8 + 2 backward passes)
+        for _ in range(19):        # time a full Stage-1 image (1 + 8 + 8 + 4 backward passes)
             torch.autograd.grad((o["hs_raw"][rl][0, -1].float() * torch.randn(h.hidden, device=v.device)).sum(),
                                 v, retain_graph=True)
         report["info"]["sec_per_stage1_image"] = time.time() - t

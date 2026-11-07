@@ -35,8 +35,26 @@ Measured exactly (no estimation error in the gradients):
   g_b = J^T w_0,   G_U = U^T J      (J = dh/dcarriers, per example for drop)
   cap(r), T(r), A(r), OC, a placebo read direction, read-space cap,
   F_eff (features reconstructed with R^2 >= 0.5), read coherence vs Welch floor.
-Regimes: d_r small (the read is the bottleneck) vs d_r large (carriers become the
-bottleneck under compression).
+
+v2.1 (alternate-analysis review, 2026-11-07)
+  * Regimes: carrier_bottleneck (d_r = 48: carriers become the bottleneck under
+    compression) and subtle_behaviour (same, but a RARE behaviour seen by fewer
+    patches -- less capacity, more superposed, closer to a VLM's minor feature).
+    read_bottleneck (d_r = 8) was uninformative and is kept in LEGACY_REGIMES only.
+  * Nulls: the random-read placebo is averaged over n_placebo directions, plus a
+    MATCHED placebo (same monitored component as w_0 at rank r_max, random
+    unmonitored part of the same norm): equal read-space capture at every r, so
+    no ceiling/floor asymmetry. The toy has no bypass channel (b depends on the
+    carriers only through h), so g_b = J^T w_0 exactly.
+  * Full-capacity (Mahalanobis-optimal) read detector: cost = |b| / sqrt(w_0^T
+    Sigma w_0) (Sigma = read covariance of the monitor set).
+  * Incidental detection: does the canonical rank-1 probe (class-mean axis,
+    midpoint threshold) flip on the plain attack delta = -1.25 b g/||g||^2? Exact
+    here (h is linear in the carriers).
+  * Every monitor rank in ``ranks`` is summarised (r = 1 is the canonical probe),
+    and every slope is also computed PER SEED: the seed (a separately trained
+    model) is the real replication unit, so sign agreement across seeds is
+    reported next to the image-level CI, which ignores training variance.
 """
 from __future__ import annotations
 
@@ -49,7 +67,8 @@ import numpy as np
 from .evasion import build_monitor_basis, nested_capture
 from . import stats as st
 
-__all__ = ["ToyCfg", "train", "measure", "sweep", "summarize", "self_check", "DEFAULT_REGIMES"]
+__all__ = ["ToyCfg", "train", "measure", "sweep", "summarize", "format_summary", "self_check",
+           "DEFAULT_REGIMES", "LEGACY_REGIMES", "nested_capture_many"]
 
 
 @dataclass
@@ -71,7 +90,24 @@ class ToyCfg:
         return 1 + self.N0 * self.Fp
 
 
-DEFAULT_REGIMES = {"read_bottleneck": dict(dr=8), "carrier_bottleneck": dict(dr=48)}
+DEFAULT_REGIMES = {"carrier_bottleneck": dict(dr=48),
+                   "subtle_behaviour": dict(dr=48, p_behaviour=0.1, q_vis=0.3)}
+LEGACY_REGIMES = {"read_bottleneck": dict(dr=8)}
+
+
+def nested_capture_many(K: np.ndarray, Z: np.ndarray, gn2: np.ndarray, tol: float = 1e-10) -> np.ndarray:
+    """Vectorised ``nested_capture`` for one K and many z: Z [n, R], gn2 [n] -> [n, R]."""
+    Z = np.atleast_2d(Z); gn2 = np.asarray(gn2, float).reshape(-1)
+    R = Z.shape[1]
+    out = np.zeros((Z.shape[0], R))
+    for r in range(1, R + 1):
+        Kr = 0.5 * (K[:r, :r] + K[:r, :r].T)
+        w, V = np.linalg.eigh(Kr)
+        keep = w > tol * max(w.max(), 1e-12)
+        zr = Z[:, :r] @ V[:, keep]
+        out[:, r - 1] = np.sum(zr ** 2 / w[keep], axis=1) / np.maximum(gn2, 1e-300)
+    out[gn2 <= 0] = 0.0
+    return np.clip(out, 0.0, 1.0)
 
 
 def sample_z(cfg: ToyCfg, n: int, rng) -> np.ndarray:
@@ -225,7 +261,8 @@ def welch(F: int, d: int) -> float:
     return math.sqrt((F - d) / (d * (F - 1))) if F > d else 0.0
 
 
-def measure(m: ToyModel, cfg: ToyCfg, ranks=(1, 2, 4), n_eval=2000, n_mon=2000, seed=123) -> Dict:
+def measure(m: ToyModel, cfg: ToyCfg, ranks=(1, 2, 4), n_eval=2000, n_mon=2000, seed=123,
+            n_placebo: int = 16, n_match: int = 8) -> Dict:
     rng = np.random.default_rng(seed)               # SAME eval inputs for every budget (paired)
     Zm = sample_z(cfg, n_mon, rng); Ze = sample_z(cfg, n_eval, rng)
     om, hm, _ = m.forward(patch_inputs(cfg, Zm, np.random.default_rng(seed + 11)),
@@ -239,7 +276,21 @@ def measure(m: ToyModel, cfg: ToyCfg, ranks=(1, 2, 4), n_eval=2000, n_mon=2000, 
     rmax = max(ranks)
     U = build_monitor_basis(hm, ym, rmax)
     w0 = m.W[0]
-    crand = np.random.default_rng(seed + 3).standard_normal(cfg.dr)
+    # nulls: n_placebo random read directions; n_match matched placebos (same U_rmax component
+    # as w0, random unmonitored component of the same norm -> same read-space cap at all r<=rmax)
+    Cp = np.random.default_rng(seed + 3).standard_normal((n_placebo, cfg.dr))
+    pc = U @ (U.T @ w0)
+    Wm = np.random.default_rng(seed + 4).standard_normal((n_match, cfg.dr))
+    Wm = Wm - (Wm @ U) @ U.T
+    Wm = Wm / (np.linalg.norm(Wm, axis=1, keepdims=True) + 1e-30) * np.linalg.norm(w0 - pc)
+    Cm = pc[None, :] + Wm
+    # canonical rank-1 probe (class-mean axis u0, midpoint threshold) and the full-capacity cost
+    u0 = U[:, 0]
+    mu1, mu0 = hm[ym == 1].mean(0), hm[ym == 0].mean(0)
+    tau_p = float(u0 @ (0.5 * (mu1 + mu0)))
+    gap = float(np.linalg.norm(mu1 - mu0)) + 1e-12
+    sd_b = float(np.std(hm @ w0, ddof=1))           # sqrt(w0^T Sigma w0)
+    s_probe = he @ u0
     out = np.maximum(oe, 0)
     r2 = 1 - ((Ze - out) ** 2).sum(0) / (((Ze - Ze.mean(0)) ** 2).sum(0) + 1e-12)
     F_eff = int((r2 >= 0.5).sum())
@@ -251,14 +302,20 @@ def measure(m: ToyModel, cfg: ToyCfg, ranks=(1, 2, 4), n_eval=2000, n_mon=2000, 
         if key not in Mcache:
             JJ = _J_metric(m, Mi)
             K = U.T @ JJ @ U
-            Mcache[key] = (JJ, K)
-        JJ, K = Mcache[key]
-        gn2 = float(w0 @ JJ @ w0)
-        cap = nested_capture(K, U.T @ JJ @ w0, gn2)
-        pn2 = float(crand @ JJ @ crand)
-        capp = nested_capture(K, U.T @ JJ @ crand, pn2)
-        recs.append({"image": i, "m": abs(float(b[i])), "gn2": gn2, "cap": cap, "cap_pl": capp,
-                     "correct": int((b[i] > 0) == (ye[i] == 1))})
+            gn2 = float(w0 @ JJ @ w0)
+            cap = nested_capture(K, U.T @ JJ @ w0, gn2)
+            pl = nested_capture_many(K, Cp @ JJ @ U, np.einsum("pi,ij,pj->p", Cp, JJ, Cp))
+            mt = nested_capture_many(K, Cm @ JJ @ U, np.einsum("pi,ij,pj->p", Cm, JJ, Cm))
+            lg = lambda c: -np.log(np.clip(c, 1e-12, 1.0))
+            Mcache[key] = (gn2, cap, pl.mean(0), lg(pl).mean(0), mt.mean(0), lg(mt).mean(0),
+                           float(u0 @ JJ @ w0))
+        gn2, cap, cpl, Apl, cmt, Amt, uJw = Mcache[key]
+        ds = -1.25 * float(b[i]) * uJw / max(gn2, 1e-30)    # exact probe shift of the plain attack
+        recs.append({"image": i, "m": abs(float(b[i])), "gn2": gn2, "cap": cap,
+                     "cap_pl": cpl, "A_pl": Apl, "cap_match": cmt, "A_match": Amt,
+                     "correct": int((b[i] > 0) == (ye[i] == 1)),
+                     "det": bool((s_probe[i] > tau_p) != (s_probe[i] + ds > tau_p)),
+                     "shift_rel": abs(ds) / gap})
     cap_read = [float(np.sum((U[:, :r].T @ w0) ** 2) / (w0 @ w0)) for r in ranks]
     Vs = [feature_dirs(m, None if Me is None else Me[i]) for i in range(min(32, n_eval))]
     coh = []
@@ -270,7 +327,8 @@ def measure(m: ToyModel, cfg: ToyCfg, ranks=(1, 2, 4), n_eval=2000, n_mon=2000, 
         coh.append((Gm.max(), Gm.sum() / max(1, live.sum() * (live.sum() - 1)), int(live.sum())))
     k = m.P.shape[0] if m.P is not None else int(round(m.keep * cfg.N0)) if m.keep < 1 else cfg.N0
     return {"recs": recs, "ranks": list(ranks), "cap_read": cap_read, "F_eff": F_eff,
-            "accuracy": float(np.mean([r["correct"] for r in recs])),
+            "accuracy": float(np.mean([r["correct"] for r in recs])), "sd_b": sd_b,
+            "probe_accuracy": float(np.mean((s_probe > tau_p) == (ye == 1))),
             "coh_max": float(np.median([c[0] for c in coh])), "coh_mean": float(np.median([c[1] for c in coh])),
             "n_live": float(np.median([c[2] for c in coh])), "welch": welch(cfg.F, cfg.dr),
             "carriers": k, "carrier_dim": k * cfg.d, "carrier_dim_full": cfg.N0 * cfg.d}
@@ -294,76 +352,136 @@ def sweep(regimes=None, methods=("pool", "drop_random", "drop_norm"), keeps=(1.0
                     res.update({"seed": seed, "keep": keep, "final_loss": hist[-1] if hist else float("nan")})
                     cells.append(res)
                     if verbose:
-                        cap = float(np.median([r["cap"][-1] for r in res["recs"]]))
+                        cap = float(np.median([r["cap"][0] for r in res["recs"]]))
                         print(f"  [{rname:18s}] {method:11s} seed={seed} keep={keep:.3f} "
                               f"loss={res['final_loss']:.4f} acc={res['accuracy']:.3f} "
-                              f"F_eff={res['F_eff']:3d} cap@{ranks[-1]}={cap:.3f}", flush=True)
+                              f"F_eff={res['F_eff']:3d} cap@1={cap:.3f}", flush=True)
             R["regimes"][rname][method] = cells
     R["summary"] = summarize(R)
     return R
 
 
-def summarize(R: Dict, B: int = 1000) -> Dict:
-    S = {}
-    for rname, meths in R["regimes"].items():
-        S[rname] = {}
-        for method, cells in meths.items():
-            x, g, lm, ng, lT, A, Ap = [], [], [], [], [], [], []
-            for c in cells:
-                for rec in c["recs"]:
-                    cap = float(np.clip(rec["cap"][-1], 1e-12, 1 - 1e-12))
-                    capp = float(np.clip(rec["cap_pl"][-1], 1e-12, 1 - 1e-12))
-                    # x = log of the ACTUAL carrier fraction (pool rounding differs from nominal keep)
-                    x.append(math.log(c["carrier_dim"] / (c["carriers_full"] if "carriers_full" in c else c["carrier_dim_full"])))
-                    g.append(c["seed"] * 100000 + rec["image"])
-                    lm.append(math.log(rec["m"] + 1e-9)); ng.append(-0.5 * math.log(rec["gn2"] + 1e-30))
-                    lT.append(-0.5 * math.log(1 - cap)); A.append(-math.log(cap)); Ap.append(-math.log(capp))
-            x, g = np.array(x), np.array(g)
-            lm, ng, lT, A, Ap = map(np.array, (lm, ng, lT, A, Ap))
-            dec = st.decompose(x, {"log_oc": lm + ng + lT, "log_m": lm, "neg_log_g": ng, "log_T": lT},
-                               g, B=B)
-            keeps = sorted({c["keep"] for c in cells}, reverse=True)
-            per_keep = []
-            for k in keeps:
-                ck = [c for c in cells if c["keep"] == k]
-                per_keep.append({"keep": k, "carrier_dim": ck[0]["carrier_dim"],
-                                 "F_eff": float(np.mean([c["F_eff"] for c in ck])),
-                                 "accuracy": float(np.mean([c["accuracy"] for c in ck])),
-                                 "cap_in": float(np.median([r["cap"][-1] for c in ck for r in c["recs"]])),
-                                 "cap_pl": float(np.median([r["cap_pl"][-1] for c in ck for r in c["recs"]])),
-                                 "cap_read": float(np.mean([c["cap_read"][-1] for c in ck])),
-                                 "coh_mean": float(np.mean([c["coh_mean"] for c in ck])),
-                                 "loss": float(np.mean([c["final_loss"] for c in ck]))})
-            fe = np.array([p["F_eff"] for p in per_keep]); cd = np.array([p["carrier_dim"] for p in per_keep])
-            alpha = float(np.polyfit(np.log(cd), np.log(np.maximum(fe, 1)), 1)[0]) if len(cd) > 1 else float("nan")
-            S[rname][method] = {"decomposition": dec,
-                                "A": st.paired_slope(x, A, g, B=B),
-                                "A_placebo": st.paired_slope(x, Ap, g, B=B),
-                                "A_minus_placebo": st.paired_slope_diff(x, A, Ap, g, B=B),
-                                "alpha_F_eff": alpha, "per_keep": per_keep}
+_TERMS = ("log_oc", "log_m", "neg_log_g", "log_T")
+_EXTRA = ("A", "A_match", "A_placebo", "A_minus_match", "A_minus_placebo", "log_full")
+
+
+def _cols(cells, r: int):
+    """Per-row arrays at monitor rank r. x = log of the ACTUAL carrier fraction."""
+    i = r - 1
+    rows = []
+    for c in cells:
+        lx = math.log(c["carrier_dim"] / c["carrier_dim_full"])
+        lsd = math.log(c["sd_b"] + 1e-30)
+        for rec in c["recs"]:
+            cap = float(np.clip(rec["cap"][i], 1e-12, 1 - 1e-12))
+            lm = math.log(rec["m"] + 1e-9)
+            ng = -0.5 * math.log(rec["gn2"] + 1e-30)
+            lT = -0.5 * math.log(1 - cap)
+            A = -math.log(cap)
+            rows.append((lx, c["seed"] * 100000 + rec["image"], c["seed"], lm + ng + lT, lm, ng, lT, A,
+                         float(rec["A_match"][i]), float(rec["A_pl"][i]), lm - lsd))
+    a = np.array(rows, float)
+    d = {"x": a[:, 0], "g": a[:, 1], "seed": a[:, 2], "log_oc": a[:, 3], "log_m": a[:, 4],
+         "neg_log_g": a[:, 5], "log_T": a[:, 6], "A": a[:, 7], "A_match": a[:, 8], "A_placebo": a[:, 9],
+         "log_full": a[:, 10]}
+    d["A_minus_match"] = d["A"] - d["A_match"]
+    d["A_minus_placebo"] = d["A"] - d["A_placebo"]
+    return d
+
+
+def _per_seed(d, keys):
+    """Point slope per seed (each seed = one separately trained set of models) and how
+    many seeds agree in sign with the pooled slope."""
+    out = {}
+    seeds = sorted(set(d["seed"].tolist()))
+    for k in keys:
+        v = []
+        for s_ in seeds:
+            sel = d["seed"] == s_
+            v.append(st.within_slope(d["x"][sel], d[k][sel], d["g"][sel]))
+        pooled = st.within_slope(d["x"], d[k], d["g"])
+        v = np.array(v, float)
+        out[k] = {"per_seed": v.tolist(), "pooled": pooled,
+                  "n_agree": int(np.sum(np.sign(v) == np.sign(pooled))), "n_seeds": len(seeds),
+                  "seed_sd": float(np.std(v, ddof=1)) if len(v) > 1 else float("nan")}
+    return out
+
+
+def summarize(R: Dict, B: int = 1000, ranks=None) -> Dict:
+    """S[r][regime][method] for every monitor rank r (r = 1 = canonical probe)."""
+    ranks = list(ranks or R["ranks"])
+    S: Dict = {}
+    for r in ranks:
+        S[r] = {}
+        for rname, meths in R["regimes"].items():
+            S[r][rname] = {}
+            for method, cells in meths.items():
+                d = _cols(cells, r)
+                x, g = d["x"], d["g"]
+                dec = st.decompose(x, {k: d[k] for k in _TERMS}, g, B=B)
+                ex = {k: st.paired_slope(x, d[k], g, B=B) for k in _EXTRA}
+                keeps = sorted({c["keep"] for c in cells}, reverse=True)
+                per_keep = []
+                for k in keeps:
+                    ck = [c for c in cells if c["keep"] == k]
+                    rr = [rec for c in ck for rec in c["recs"]]
+                    per_keep.append({"keep": k, "carrier_dim": ck[0]["carrier_dim"],
+                                     "F_eff": float(np.mean([c["F_eff"] for c in ck])),
+                                     "accuracy": float(np.mean([c["accuracy"] for c in ck])),
+                                     "probe_accuracy": float(np.mean([c["probe_accuracy"] for c in ck])),
+                                     "cap_in": float(np.median([q["cap"][r - 1] for q in rr])),
+                                     "cap_match": float(np.median([q["cap_match"][r - 1] for q in rr])),
+                                     "cap_pl": float(np.median([q["cap_pl"][r - 1] for q in rr])),
+                                     "cap_read": float(np.mean([c["cap_read"][ranks.index(r)] for c in ck]))
+                                     if r in R["ranks"] else float("nan"),
+                                     "T": float(np.median([1 / math.sqrt(1 - min(q["cap"][r - 1], 1 - 1e-12))
+                                                           for q in rr])),
+                                     "full_cost": float(np.median([q["m"] / (c["sd_b"] + 1e-30)
+                                                                   for c in ck for q in c["recs"]])),
+                                     "incidental_det": float(np.mean([q["det"] for q in rr])),
+                                     "shift_rel": float(np.median([q["shift_rel"] for q in rr])),
+                                     "coh_mean": float(np.mean([c["coh_mean"] for c in ck])),
+                                     "loss": float(np.mean([c["final_loss"] for c in ck]))})
+                fe = np.array([p["F_eff"] for p in per_keep]); cd = np.array([p["carrier_dim"] for p in per_keep])
+                alpha = float(np.polyfit(np.log(cd), np.log(np.maximum(fe, 1)), 1)[0]) if len(cd) > 1 else float("nan")
+                S[r][rname][method] = {"decomposition": dec, **ex,
+                                       "per_seed": _per_seed(d, ("log_oc", "log_T", "A_minus_match", "log_full")),
+                                       "alpha_F_eff": alpha, "per_keep": per_keep}
     return S
 
 
 def format_summary(S: Dict, r: int) -> str:
-    L = [f"X1b trained toy (monitor rank r={r}); beta = d log X / d log(carrier fraction) "
-         "(beta>0: X falls under compression)"]
+    S = S[r]
+    L = [f"X1b trained toy -- monitor rank r={r}" + ("  (CANONICAL rank-1 probe)" if r == 1 else "")
+         + "\n  beta = d log X / d log(carrier fraction); beta>0: X falls under compression"
+         + "\n  [seeds a/n] = seeds (separately trained models) whose own slope has the pooled sign"]
     for rname, meths in S.items():
         L.append(f"\n== regime: {rname}")
         for method, M in meths.items():
-            d = M["decomposition"]
+            d, ps = M["decomposition"], M["per_seed"]
+            sa = lambda k: f"  [seeds {ps[k]['n_agree']}/{ps[k]['n_seeds']}]"
             L.append(f" [{method}]  alpha(F_eff vs carrier dim) = {M['alpha_F_eff']:+.2f}")
-            L.append("   " + st.describe_slope("log OC", d["log_oc"], "OC falls", "OC rises"))
+            L.append("   " + st.describe_slope("log OC", d["log_oc"], "OC falls", "OC rises") + sa("log_oc"))
             L.append("   " + st.describe_slope("  log m (info)", d["log_m"], "margin falls", "margin rises"))
             L.append("   " + st.describe_slope("  -log||g|| (robust)", d["neg_log_g"], "less robust", "more robust"))
             L.append("   " + st.describe_slope("  log T (audit tax)", d["log_T"],
-                                               "TAX FALLS (auditability worse)", "TAX RISES (auditability better)"))
-            L.append("   " + st.describe_slope("A - A_placebo", M["A_minus_placebo"],
-                                               "monitor sees MORE than geometry predicts",
-                                               "monitor sees LESS than geometry predicts"))
-            L.append("     keep  carr_dim  F_eff   acc   cap_in  cap_pl  cap_read  coh_mean  loss")
+                                               "TAX FALLS (auditability worse)", "TAX RISES (auditability better)")
+                     + sa("log_T"))
+            L.append("   " + st.describe_slope("A - A_matched", M["A_minus_match"],
+                                               "monitor sees MORE than matched null",
+                                               "monitor sees LESS than matched null") + sa("A_minus_match"))
+            L.append("   " + st.describe_slope("A - A_placebo(avg)", M["A_minus_placebo"],
+                                               "monitor sees MORE than random reads",
+                                               "monitor sees LESS than random reads"))
+            L.append("   " + st.describe_slope("full-capacity cost", M["log_full"],
+                                               "falls (optimal detector loses ground)", "rises") + sa("log_full"))
+            L.append("     keep  carr_dim  F_eff  acc   p_acc  cap_in  cap_mt  cap_pl  cap_read   T     "
+                     "full   incid  coh_mean  loss")
             for p in M["per_keep"]:
-                L.append(f"    {p['keep']:.3f}  {p['carrier_dim']:6d}  {p['F_eff']:5.1f}  {p['accuracy']:.3f}  "
-                         f"{p['cap_in']:.3f}   {p['cap_pl']:.3f}   {p['cap_read']:.3f}    {p['coh_mean']:.3f}  {p['loss']:.4f}")
+                L.append(f"    {p['keep']:.3f}  {p['carrier_dim']:6d}  {p['F_eff']:5.1f}  {p['accuracy']:.3f} "
+                         f"{p['probe_accuracy']:.3f}  {p['cap_in']:.3f}   {p['cap_match']:.3f}   {p['cap_pl']:.3f}"
+                         f"   {p['cap_read']:.3f}   {p['T']:.3f}  {p['full_cost']:.3f}  {p['incidental_det']:.3f}"
+                         f"   {p['coh_mean']:.3f}   {p['loss']:.4f}")
     return "\n".join(L)
 
 
@@ -401,6 +519,27 @@ def self_check(verbose: bool = False) -> bool:
         if oc <= 0 or not np.isfinite(oc):
             ok = False
             print(f"[x1b self-check] non-finite OC for {method}")
+    # plain attack in an explicit carrier Jacobian: b -> -0.25 b, probe shift = formula
+    rng = np.random.default_rng(5)
+    m = ToyModel(cfg, "drop_random", 0.5, rng)
+    Mi = np.array([1.0, 0.0, 1.0, 1.0])
+    Jx = np.concatenate([m.R[j] * Mi[j] for j in range(cfg.N0)], axis=1)     # [dr, N0*d]
+    if np.abs(Jx @ Jx.T - _J_metric(m, Mi)).max() > 1e-10:
+        ok = False
+        print("[x1b self-check] explicit J J^T != _J_metric")
+    w0 = m.W[0]; u0 = rng.standard_normal(cfg.dr); bval = 0.9
+    gvec = Jx.T @ w0; gn2 = float(gvec @ gvec)
+    delta = -1.25 * bval * gvec / gn2
+    if abs((bval + w0 @ (Jx @ delta)) - (-0.25 * bval)) > 1e-10 or \
+            abs(u0 @ (Jx @ delta) - (-1.25 * bval * float(u0 @ _J_metric(m, Mi) @ w0) / gn2)) > 1e-10:
+        ok = False
+        print("[x1b self-check] plain-attack algebra mismatch")
+    # vectorised nested capture == scalar version
+    K = rng.standard_normal((3, 3)); K = K @ K.T
+    Zz = rng.standard_normal((5, 3)); gg = np.sum(Zz ** 2, 1) * 3
+    if np.abs(nested_capture_many(K, Zz, gg) - np.stack([nested_capture(K, z, g_) for z, g_ in zip(Zz, gg)])).max() > 1e-12:
+        ok = False
+        print("[x1b self-check] nested_capture_many != nested_capture")
     # explicit min-norm check on a random linear system
     rng = np.random.default_rng(3)
     J = rng.standard_normal((6, 20)); w = rng.standard_normal(6); U = np.linalg.qr(rng.standard_normal((6, 2)))[0]
