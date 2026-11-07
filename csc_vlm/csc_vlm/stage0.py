@@ -345,7 +345,9 @@ class Stage0VLM:
             n_car, n_vis = plan.n_carriers, plan.n_visual
             if plan.read_restrict is not None:          # readout_only: the READ is what shrinks
                 n_car = int(plan.read_restrict.numel())
-        blk = hs[rows].cpu().numpy().astype(np.float64)
+        # multi-GPU (device_map="auto"): plan tensors live on the EMBEDDING device, while the
+        # read layer's hidden states live on that layer's device -> index on hs's device
+        blk = hs[rows.to(hs.device)].cpu().numpy().astype(np.float64)
         last = hs[-1].cpu().numpy().astype(np.float64)
         pr = participation_ratio(blk)
         if blk.shape[0] >= 10:

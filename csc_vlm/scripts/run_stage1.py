@@ -112,6 +112,9 @@ def main():
     ap.add_argument("--methods", default=",".join(METHODS))
     ap.add_argument("--no-staleness", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--multi-gpu", action="store_true",
+                    help="spread the model over all visible GPUs (device_map=auto), e.g. Kaggle 2xT4 "
+                         "when fp32 does not fit on one card. Default: one GPU (faster).")
     ap.add_argument("--self-check", action="store_true")
     args = ap.parse_args()
     keeps = [float(x) for x in args.keeps.split(",")] if args.keeps else list(DEFAULT_KEEPS)
@@ -155,7 +158,7 @@ def main():
                            device=args.device, dtype=args.dtype, n_eval=args.n_images,
                            n_monitor=args.n_monitor, seed=args.seed)
         handle = VLMHandle.from_pretrained(args.model, model_id=args.model_id, dtype=args.dtype,
-                                           device=args.device, single_device=True,
+                                           device=args.device, single_device=not args.multi_gpu,
                                            read_layer_frac=args.read_layer_frac,
                                            query_layer=args.query_layer)
         coll = Stage1VLM(cfg, images, labels, handle=handle, seed=args.seed)

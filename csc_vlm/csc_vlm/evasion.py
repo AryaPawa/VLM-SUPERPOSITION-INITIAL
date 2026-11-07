@@ -442,7 +442,7 @@ class Stage1VLM:
                 gj = self._grad((Uf[:, j] * hlast).sum(), v)
                 fr.append(gj if gj is not None else torch.zeros_like(gb))
             Gf = torch.stack(fr, 0)
-        g_pr = self._grad((self.c_rand * hlast).sum(), v)
+        g_pr = self._grad((self.c_rand.to(hlast.device) * hlast).sum(), v)
         g_rp = g_mt = None
         if c is not None:
             cdet = c.detach()

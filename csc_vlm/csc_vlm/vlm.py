@@ -160,11 +160,27 @@ class VLMHandle:
                   "prefer --dtype bfloat16 (Ampere+) or float32.")
         return h
 
+    def device_layout(self) -> Dict:
+        """Where things live. With device_map="auto" on several GPUs the embedding, the read
+        layer and the LM head can sit on different devices; all code indexes a tensor on
+        its own device, so this is informational."""
+        def dev(mod):
+            for p in mod.parameters():
+                return str(p.device)
+            return "none"
+        out_emb = self.model.get_output_embeddings()
+        layer_devs = [dev(l) for l in self.layers]
+        return {"embed": str(self.device), "read_layer": layer_devs[self.read_layer - 1],
+                "query_layer": layer_devs[self.query_layer - 1],
+                "lm_head": dev(out_emb) if out_emb is not None else "none",
+                "layer_devices": sorted(set(layer_devs)),
+                "multi_device": len(set(layer_devs) | {str(self.device)}) > 1}
+
     def describe(self) -> Dict:
         return {"model": self.name, "text_backbone": self.text_name, "n_layers": self.n_layers,
                 "hidden": self.hidden, "read_layer": self.read_layer,
                 "query_layer": self.query_layer, "dtype": str(self.dtype),
-                "image_token_id": self.image_token_id}
+                "image_token_id": self.image_token_id, "devices": self.device_layout()}
 
     # ------------------------------------------------------------------ prompts
     def prepare(self, image, prompt: str) -> Dict:

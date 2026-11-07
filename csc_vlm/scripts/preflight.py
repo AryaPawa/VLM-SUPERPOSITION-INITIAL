@@ -48,6 +48,10 @@ def main():
     ap.add_argument("--dtype", default="auto")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--grad", action="store_true", help="also check Stage-1 gradients")
+    ap.add_argument("--multi-gpu", action="store_true",
+                    help="with --grad: spread the model over all GPUs (device_map=auto), as "
+                         "run_stage1.py --multi-gpu does. Without --grad the model is always "
+                         "loaded like run_stage0.py (device_map=auto).")
     ap.add_argument("--out", default="runs_preflight/default")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -71,10 +75,13 @@ def main():
     print("[1] loading model ...")
     t0 = time.time()
     h = VLMHandle.from_pretrained(args.model, model_id=args.model_id, dtype=args.dtype,
-                                  device=args.device, single_device=args.grad)
+                                  device=args.device, single_device=args.grad and not args.multi_gpu)
     report["info"]["model"] = h.describe()
     report["info"]["load_seconds"] = time.time() - t0
     print("   ", h.describe())
+    lay = h.device_layout()
+    print(f"    devices: embed {lay['embed']}, read layer {lay['read_layer']}, lm_head {lay['lm_head']}"
+          f"{'  (MULTI-DEVICE)' if lay['multi_device'] else ''}")
 
     per_class = max(2, (args.n + 1) // 2)
     images, labels = load_images(args.dataset, per_class=per_class, seed=args.seed)
@@ -136,6 +143,17 @@ def main():
         except Exception as e:  # noqa: BLE001
             check(f"compress_{m}", False, f"{type(e).__name__}: {str(e)[:200]}")
 
+    print("[4b] Stage-0 measurement path (the exact code run_stage0.py runs) ...")
+    for m in ("none", "pool", "drop_norm", "drop_query", "merge_dup", "readout_only"):
+        try:
+            k_ = 1.0 if m == "none" else args.keep
+            r_ = s0.one(int(s0.eval_idx[0]), "pool" if m == "none" else m, k_)
+            ok = np.isfinite(r_["margin"]) and np.isfinite(r_["blk_pr"])
+            check(f"stage0_one_{m}", ok, f"margin {r_['margin']:+.3f}, block PR {r_['blk_pr']:.2f}, "
+                  f"carriers {r_['n_carriers']}")
+        except Exception as e:  # noqa: BLE001
+            check(f"stage0_one_{m}", False, f"{type(e).__name__}: {str(e)[:200]}")
+
     print("[5] mask_norm == drop_norm (positions preserved) ...")
     worst = 0.0
     for i in range(min(3, len(images))):
@@ -154,7 +172,8 @@ def main():
         bb = torch.logsumexp(o["logits"][s0.pos_ids], 0) - torch.logsumexp(o["logits"][s0.neg_ids], 0)
         g = torch.autograd.grad(bb, v, retain_graph=True)[0]
         for _ in range(19):        # time a full Stage-1 image (1 + 8 + 8 + 4 backward passes)
-            torch.autograd.grad((o["hs_raw"][rl][0, -1].float() * torch.randn(h.hidden, device=v.device)).sum(),
+            hr = o["hs_raw"][rl]
+            torch.autograd.grad((hr[0, -1].float() * torch.randn(h.hidden, device=hr.device)).sum(),
                                 v, retain_graph=True)
         report["info"]["sec_per_stage1_image"] = time.time() - t
         gn = float(g.float().norm())
