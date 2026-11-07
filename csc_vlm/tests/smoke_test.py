@@ -28,9 +28,10 @@ def _run(args, cwd):
     """Run a CLI command; return (returncode, stdout+stderr). 180 s cap."""
     env = dict(os.environ)
     env["MPLBACKEND"] = "Agg"                     # headless matplotlib
+    env["PYTHONIOENCODING"] = "utf-8"             # child writes UTF-8 even when piped on Windows
     proc = subprocess.run([sys.executable, *args], cwd=cwd, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True, timeout=180)
+                          text=True, encoding="utf-8", errors="replace", timeout=180)
     return proc.returncode, proc.stdout
 
 

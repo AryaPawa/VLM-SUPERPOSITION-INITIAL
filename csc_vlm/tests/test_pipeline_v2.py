@@ -126,6 +126,57 @@ def test_stage0_and_stage1_end_to_end(handle):
     dec = R1["summary"]["methods"]["pool"]["decomposition"]
     assert abs(dec["recon_error"]) < 1e-8
     assert isinstance(format_stage1(R1["summary"]), str)
+    assert R1["summary"]["r"] == 1 and R1["summary_rmax"]["r"] == 4
+    for r in ok:
+        for k in ("cap_readpath", "cap_match", "cap_pl_out", "cap_pl_read", "cap_frozen"):
+            assert len(r[k]) == 4 and all(np.diff(r[k]) >= -1e-9), k
+        assert r["c_var"] > 0 and "detected_fo" in r["probe"]
+    assert any("unc_probe_flipped" in r.get("check", {}) for r in ok)
+    assert "specific(A_readpath - A_match)" in R1["summary"]["methods"]["pool"]["placebo_diffs"]
+
+
+def test_stage1_new_quantities_match_independent_computation(handle):
+    """read-path pullback J^T c (finite difference), canonical probe score, c^T Sigma c,
+    and the matched placebo's read-space capture equal to the behaviour's at every r."""
+    from csc_vlm.stage0 import Stage0Config
+    from csc_vlm.evasion import Stage1VLM
+    images = list(range(24)); labels = np.array([i % 2 for i in images])
+    cfg = Stage0Config(dataset="hf:microsoft/cats_vs_dogs", n_eval=6, n_monitor=12)
+    pos, neg = [13, 14], [11, 12]
+    C = Stage1VLM(cfg, images, labels, handle=handle, pos_ids=pos, neg_ids=neg)
+    keep, meth = 0.5, "pool"
+    C.fit_monitors(keep, meth, r_max=4, r_basis=8, r_frozen=4)
+    i, rl = int(C.s0.eval_idx[0]), handle.read_layer
+    rec = C.one(i, meth, keep, 4, 4, (1, 2, 4), True, True)
+    inp = C.s0.inputs(i)
+    o = handle.compressed_run(inp, meth, keep, image_key=i, seed=0, make_leaf=True, capture=(rl,), grad=True)
+    v, hraw = o["leaf"], o["hs_raw"][rl]
+    b = torch.logsumexp(o["logits"][pos], 0) - torch.logsumexp(o["logits"][neg], 0)
+    if C.s0.polarity_flipped:
+        b = -b
+    c = torch.autograd.grad(b, hraw, retain_graph=True)[0][0, -1].detach()
+    grp = torch.autograd.grad((c * hraw[0, -1]).sum(), v)[0]
+    u = torch.randn_like(v); u = u / u.norm(); eps = 1e-3
+
+    def hl(vv):
+        return handle.compressed_run(inp, meth, keep, image_key=i, seed=0, capture=(rl,),
+                                     carriers_override=vv)["hs"][rl][-1].float()
+    fd = float(c @ (hl(v.detach() + eps * u) - hl(v.detach() - eps * u))) / (2 * eps)
+    an = float((grp * u).sum())
+    assert abs(fd - an) < 2e-3 * (1 + abs(an)), (fd, an)
+    s = float(np.dot(C.U_refit[:, 0], hraw[0, -1].detach().double().numpy()))
+    assert abs(s - rec["probe"]["s"]) < 1e-5
+    cn = c.double().numpy()
+    assert abs(float(np.var(C.Hc @ cn, ddof=1)) - rec["c_var"]) < 1e-6 * (1 + rec["c_var"])
+    Ur = torch.tensor(C.U_refit[:, :4], dtype=torch.float32)
+    pc = Ur @ (Ur.T @ c)
+    w = torch.randn(c.shape[0], generator=torch.Generator().manual_seed(i * 7919 + 17))
+    w = w - Ur @ (Ur.T @ w); w = w / w.norm() * (c - pc).norm()
+    cm = pc + w
+    for r in (1, 2, 4):
+        a1 = float((Ur[:, :r].T @ c).pow(2).sum() / c.pow(2).sum())
+        a2 = float((Ur[:, :r].T @ cm).pow(2).sum() / cm.pow(2).sum())
+        assert abs(a1 - a2) < 1e-4, (r, a1, a2)
 
 
 def test_trained_toy_selfcheck():

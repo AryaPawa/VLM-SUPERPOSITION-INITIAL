@@ -28,6 +28,8 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from csc_vlm._io import utf8_stdio  # noqa: E402
+utf8_stdio()
 from csc_vlm.stage0 import (DEFAULT_KEEPS, METHODS, Stage0Config, Stage0Mock,  # noqa: E402
                             Stage0VLM, run_stage0)
 from csc_vlm import stats as st  # noqa: E402

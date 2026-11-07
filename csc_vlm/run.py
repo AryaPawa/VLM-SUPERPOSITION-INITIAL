@@ -34,6 +34,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from csc_vlm._io import utf8_stdio  # noqa: E402
+utf8_stdio()
 
 from csc_vlm.backends import VLMConfig                          # noqa: E402
 from csc_vlm.runner import run_frontier, self_check            # noqa: E402

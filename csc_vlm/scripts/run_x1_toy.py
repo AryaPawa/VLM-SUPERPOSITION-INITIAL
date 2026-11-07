@@ -36,6 +36,8 @@ import numpy as np
 
 # allow running from scripts/ or repo root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from csc_vlm._io import utf8_stdio  # noqa: E402
+utf8_stdio()
 from csc_vlm import toy  # noqa: E402
 from csc_vlm.toy import (ToyConfig, make_geometry, sample_reads, reads_packed,
                          behaviour_direction, behaviour_labels, compress_prune,

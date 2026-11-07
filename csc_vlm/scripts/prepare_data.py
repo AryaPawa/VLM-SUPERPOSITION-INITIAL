@@ -13,6 +13,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from csc_vlm._io import utf8_stdio  # noqa: E402
+utf8_stdio()
 from csc_vlm import data as datamod
 
 
