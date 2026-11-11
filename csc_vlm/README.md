@@ -30,6 +30,56 @@ fraction), so beta > 0 means X **falls** under compression.
 
 ---
 
+## Pipeline v3 (2026-11-11): real attacks in a fixed space (`attack.py`)
+
+The cluster runs (Stage 0 on Qwen-3B/LLaVA-7B; Stage 1 on Qwen-3B/SmolVLM) showed:
+- **packing (ρ_blk) is null;**
+- **the first-order monitor tax T never falls** (0/32 cells);
+- **the first-order OC is not trustworthy.** It is linear (Qwen reaches 39–47 % of the predicted change), measured in a keep-dependent space, uses an equality constraint, freezes the selection, and defines the attack direction by the current answer. v3 measures the costs with a real optimiser.
+
+| quantity | definition (min ‖δ‖ in a FIXED space) | meaning |
+|---|---|---|
+| `OC_free` | answer becomes the WRONG label | robustness |
+| `OC_thr` | wrong answer AND the rank-1 probe tripwire stays silent | cost of a hidden attack |
+| `OC_eq` | wrong answer AND probe reading unchanged (±5 % of the class gap) | Stage-1-comparable |
+| `T_true` | `OC_thr / OC_free` (`log OC_thr = log OC_free + log T_true` exactly) | the monitor's leverage |
+
+- **Protocol:** the probe is a *tripwire* that fires when it reads the target class. Under a disagreement-flagging protocol the same numbers read the other way, which is why all three costs are reported.
+- **Leaves:**
+  - `patch` = pre-compression visual-token embeddings (the instrument check);
+  - `pixel` = normalised pixels clipped to valid images.
+- **Selection:**
+  - `frozen` reuses the clean plan;
+  - `live` rebuilds drop_norm / drop_query on the perturbed input (BPDA, so the measured steering advantage is a lower bound).
+- **Optimiser:** constrained FAB (Croce & Hein 2020). Each step solves the linearised min-norm problem exactly (`min_norm_point`, active-set KKT), and the run ends with a ray bisection.
+- **Every reported cost is a verified success in the true model:** an upper bound on the true minimum. On linear targets it matches the closed form within 0.3 %; on curved 2-D targets it is within 1.5 % of a brute-force minimum (tests).
+
+**Pre-registered reading** (`scripts/analyze_attack.py`):
+
+| check | rule |
+|---|---|
+| instrument (patch, frozen) | PASS iff Spearman(lin, true) ≥ 0.5 at every keep with ≥ 8 attacks AND the CI of the slope of log(true/lin) lies inside ±0.1. Otherwise OC_lin is diagnostic only and the true costs are primary. |
+| robustness | slope of log OC_free (β > 0: attacks get cheaper under compression), split by attack direction (y=1 hide / y=0 induce) |
+| monitor leverage | slope of log T_true; check `T<1` (should be ≈ 0: a measured T < 1 means the free attack was sub-optimal) |
+| hidden attack | slope of log OC_thr = log OC_free + log T_true |
+| incidental detection | P(tripwire fires \| plain attack succeeded) per keep, Wilson CI, paired k_min − k_1 |
+| **H-R2** (selection steering) | log(OC_frozen/OC_live) > 0 in images whose live selection CHANGED, beyond the noise floor of images whose selection did not; R2 index = steering(thr) − steering(free) > 0 means steering specifically helps HIDDEN attacks |
+
+Hypotheses updated after the cluster runs:
+- H1/H3 (compression → packing → cheaper monitor evasion) are refuted at first order.
+- **New hypotheses:**
+  - **H-R2:** live selection lowers OC_thr more than OC_free.
+  - **H-stale:** the frozen-probe AUROC falls on non-saturated concepts (seen in Stage 0).
+  - **H-bias:** compression shifts answers toward the default label, asymmetrically by direction (seen in Stage 0).
+
+```
+python scripts/run_attack.py --self-check                     # CPU, < 1 min
+sbatch scripts/run_attack.slurm                               # 4 array tasks: {patch,pixel} x {bottle,cats}
+python scripts/analyze_attack.py runs_attack/*/attack_results.json
+```
+
+---
+
 ## Run order (each step decides the next)
 
 ```
@@ -39,6 +89,7 @@ fraction), so beta > 0 means X **falls** under compression.
 2. GPU, 1-4 h:     python scripts/run_stage0.py --model qwen-3b --dataset hf:microsoft/cats_vs_dogs --out runs_stage0/qwen3b_cats
 3. GPU, 2-8 h:     CUDA_VISIBLE_DEVICES=0 python scripts/run_stage1.py --model qwen-3b --out runs_stage1/qwen3b_cats
 4. CPU:            python scripts/analyze_stage1.py runs_stage1/qwen3b_cats/stage1_results.json --r 4
+5. GPU, 3-9 h:     sbatch scripts/run_attack.slurm      # pipeline v3 (instrument check + R2 test)
 ```
 
 ### Kaggle (GPU T4 / P100, Internet ON)
@@ -60,7 +111,8 @@ fraction), so beta > 0 means X **falls** under compression.
 ### Cluster (H100, SLURM)
 `sbatch scripts/run_stage0.slurm`, then `sbatch scripts/run_stage1.slurm`. Both
 run the preflight first and skip any model that fails it. Edit `MODELS` and
-`DATASETS` at the top of each script.
+`DATASETS` at the top of each script. Pipeline v3: `sbatch scripts/run_attack.slurm`.
+It checkpoints after every image and resumes when resubmitted.
 
 ### Datasets / concepts
 | spec | concept | note |
@@ -147,15 +199,24 @@ python -m pytest tests/ -v
   mask == drop, that the identity leaf reproduces the logits, that leaf
   gradients match finite differences, that the Gram capture matches QR, that
   Stage 0/1 run end to end, and the X1b self-check. It is skipped without torch.
+* `tests/test_attack.py` (v3) checks:
+  - a zero `span_delta` reproduces the compressed logits;
+  - patch- and pixel-leaf gradients match finite differences;
+  - a live selection follows the perturbed input;
+  - the exact min-norm solver and closed-form agreement;
+  - brute-force optimality on curved targets;
+  - the full grid runs end to end with verified successes, and resume works.
 
 ## Layout
 ```
 csc_vlm/  compression.py vlm.py stats.py stage0.py evasion.py toy.py toy_trained.py data.py
+          attack.py attack_analysis.py                      (pipeline v3)
           (legacy) backends.py geometry.py solver.py runner.py
 scripts/  preflight.py run_stage0.py run_stage1.py analyze_stage1.py run_x1_toy.py run_x1b_toy.py
+          run_attack.py analyze_attack.py run_attack.slurm  (pipeline v3)
           run_stage0.slurm run_stage1.slurm build_person_dataset.py prepare_data.py
           (legacy) run_matrix.sh run_llava.slurm run_qwen.slurm run_csc.slurm
-tests/    smoke_test.py test_pipeline_v2.py tiny_models.py
+tests/    smoke_test.py test_pipeline_v2.py test_attack.py tiny_models.py
 ```
 
 ---

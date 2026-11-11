@@ -62,6 +62,14 @@ def test_x1b_trained_toy_selfcheck(tmp_path):
     assert "PASS" in log, f"x1b self-check did not pass\n{log}"
 
 
+def test_attack_selfcheck(tmp_path):
+    """Pipeline v3 attack: exact min-norm solver, closed-form agreement, analysis (CPU torch)."""
+    pytest.importorskip("torch")
+    rc, log = _run([os.path.join(SCRIPTS, "run_attack.py"), "--self-check"], cwd=str(tmp_path))
+    assert rc == 0, f"attack self-check exited {rc}\n{log}"
+    assert "ALL PASS" in log, f"attack self-check did not pass\n{log}"
+
+
 def test_stage0_selfcheck(tmp_path):
     """Stage 0 metric/orchestration self-check (mock, no torch)."""
     rc, log = _run([os.path.join(SCRIPTS, "run_stage0.py"), "--self-check",

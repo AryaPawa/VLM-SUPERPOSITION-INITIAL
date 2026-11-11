@@ -283,7 +283,8 @@ class VLMHandle:
     # ------------------------------------------------------------------ forward
     def run(self, inp: Dict, plan_fn: Optional[Callable[[torch.Tensor, List[Run]], Plan]] = None,
             *, make_leaf: bool = False, capture: Sequence[int] = (), grad: bool = False,
-            runs: Optional[List[Run]] = None, carriers_override=None) -> Dict:
+            runs: Optional[List[Run]] = None, carriers_override=None,
+            span_delta: Optional[torch.Tensor] = None, grad_emb: bool = False) -> Dict:
         """One forward pass with an optional compression plan.
 
         plan_fn(emb_span [n_vis, D], runs) -> Plan  is called inside the text-backbone
@@ -292,7 +293,21 @@ class VLMHandle:
         (index i = output of decoder layer i-1, i.e. HF hidden_states[i]).
         Returns dict(logits [V] float32, hs {i: [T', D]} (views), hs_raw {i: [1, T', D]}
         (graph tensors, differentiate w.r.t. these), plan, leaf, T, new_len, runs).
+
+        Attack leaves (pipeline v3, ``attack.py``):
+          span_delta  [n_vis, D] perturbation added to the PRE-compression visual-token
+                      embeddings (the fixed "patch" space, same size at every keep).
+                      Carriers become Wc @ (emb_span + span_delta), so gradients reach
+                      span_delta through the compression. Requires a plan_fn (use the
+                      identity plan for keep = 1).
+          grad_emb    keep the graph from inputs_embeds into the carriers (pixel leaf:
+                      gradients flow pixels -> vision tower -> emb_span -> Wc -> LM).
+          plan_fn receives the (possibly perturbed) embeddings DETACHED, so a live
+          selection (drop_norm / drop_query) is recomputed on the perturbed input but is
+          piecewise constant for autograd (BPDA / straight-through on the selection).
         """
+        if span_delta is not None and (plan_fn is None or make_leaf or carriers_override is not None):
+            raise ValueError("span_delta needs a plan_fn and excludes make_leaf / carriers_override")
         runs = runs if runs is not None else self.visual_runs(inp)
         span = [p for r in runs for p in r.positions]
         T_ids = int(inp["input_ids"].shape[1])
@@ -319,10 +334,19 @@ class VLMHandle:
             if plan_fn is None:
                 return None
             emb_span = emb[0, span]
-            plan = plan_fn(emb_span.detach(), runs)
+            if span_delta is not None:
+                if tuple(span_delta.shape) != tuple(emb_span.shape):
+                    raise ValueError(f"span_delta shape {tuple(span_delta.shape)} != visual span "
+                                     f"{tuple(emb_span.shape)}")
+                base = emb_span.detach() + span_delta.to(emb_span.device, emb_span.dtype)
+            elif grad_emb:
+                base = emb_span
+            else:
+                base = emb_span.detach()
+            plan = plan_fn(base.detach(), runs)
             state["plan"] = plan
-            passthrough = (not make_leaf and carriers_override is None and not plan.shortened
-                           and plan.mask_zero_rows.numel() == 0
+            passthrough = (not make_leaf and carriers_override is None and span_delta is None
+                           and not plan.shortened and plan.mask_zero_rows.numel() == 0
                            and plan.method in ("none", "readout_only"))
             if passthrough:
                 return None
@@ -331,7 +355,7 @@ class VLMHandle:
                     raise ValueError("carriers_override shape does not match the plan")
                 carriers = carriers_override.detach().to(emb_span.device, emb_span.dtype)
             else:
-                carriers = plan.Wc.to(emb_span.dtype) @ emb_span.detach()
+                carriers = plan.Wc.to(base.dtype) @ base
             if make_leaf:
                 carriers = carriers.detach().clone().requires_grad_(True)
             state["leaf"] = carriers
@@ -375,12 +399,18 @@ class VLMHandle:
                 "runs": runs}
 
     # ------------------------------------------------------------------ helpers
-    def query_scores(self, inp: Dict, runs: Optional[List[Run]] = None) -> np.ndarray:
+    def query_scores(self, inp: Dict, runs: Optional[List[Run]] = None,
+                     span_delta: Optional[torch.Tensor] = None) -> np.ndarray:
         """drop_query relevance: cos(h_q[visual], h_q[last]) at hidden_states[query_layer]
-        from one uncompressed no-grad pass."""
+        from one uncompressed no-grad pass (optionally with a patch-space perturbation)."""
         runs = runs if runs is not None else self.visual_runs(inp)
         span = [p for r in runs for p in r.positions]
-        o = self.run(inp, None, capture=(self.query_layer,), runs=runs)
+        if span_delta is not None:
+            T = int(inp["input_ids"].shape[1])
+            o = self.run(inp, lambda e, rr: build_plan("none", 1.0, T, rr, e),
+                         capture=(self.query_layer,), runs=runs, span_delta=span_delta.detach())
+        else:
+            o = self.run(inp, None, capture=(self.query_layer,), runs=runs)
         h = o["hs"][self.query_layer].float()
         v, q = h[span], h[-1]
         s = torch.nn.functional.cosine_similarity(v, q[None, :], dim=-1)
