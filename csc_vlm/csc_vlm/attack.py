@@ -83,12 +83,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-__all__ = ["MODES", "LEAVES", "SELECTIONS", "SELECTION_METHODS", "DEFAULT_KEEPS",
+__all__ = ["MODES", "HIDDEN_MODES", "LEAVES", "SELECTIONS", "SELECTION_METHODS", "DEFAULT_KEEPS",
            "DEFAULT_METHODS", "AttackCfg", "Probe", "min_norm_point", "lin_cost",
            "attack_image", "fit_probe", "pixel_box", "VLMTarget", "LinearTarget",
            "run_attacks"]
 
-MODES: Tuple[str, ...] = ("free", "thr", "eq")
+MODES: Tuple[str, ...] = ("free", "thr", "thrq", "eq")
+HIDDEN_MODES: Tuple[str, ...] = ("thr", "thrq")
 LEAVES: Tuple[str, ...] = ("patch", "pixel")
 SELECTIONS: Tuple[str, ...] = ("frozen", "live")
 SELECTION_METHODS: Tuple[str, ...] = ("drop_norm", "drop_query")   # input-dependent selection
@@ -145,6 +146,40 @@ def min_norm_point(A: torch.Tensor, d: Sequence[float], is_eq: Sequence[bool]
     return x, math.sqrt(max(best_n2, 0.0))
 
 
+def min_norm_point_box(A: torch.Tensor, d: Sequence[float], is_eq: Sequence[bool],
+                       L: Optional[torch.Tensor], H: Optional[torch.Tensor], max_pass: int = 8
+                       ) -> Tuple[Optional[torch.Tensor], float]:
+    """min ||v|| s.t. the linear constraints of ``min_norm_point`` AND L <= v <= H
+    (L <= 0 <= H). Active-set on the box: coordinates whose unconstrained solution
+    leaves the box are fixed at the bound they hit, and the problem is re-solved on the
+    remaining coordinates with the fixed part moved to the right-hand side. With one
+    linear constraint this is FAB's exact projection onto hyperplane-and-box (Croce &
+    Hein 2020). Without it (v3.0) a gradient concentrated on saturated pixels was
+    clipped away at every step and the pixel attack stalled."""
+    if L is None or H is None:
+        return min_norm_point(A, d, is_eq)
+    A2 = A.reshape(A.shape[0], -1).double()
+    Lf, Hf = L.reshape(-1).double(), H.reshape(-1).double()
+    dd = [float(v) for v in d]
+    fixed = torch.zeros(A2.shape[1], dtype=torch.bool, device=A2.device)
+    val = torch.zeros(A2.shape[1], dtype=torch.float64, device=A2.device)
+    v = None
+    for _ in range(max_pass):
+        Af = A2.masked_fill(fixed[None], 0.0)
+        shift = (A2[:, fixed] @ val[fixed]).cpu() if bool(fixed.any()) else torch.zeros(A2.shape[0], dtype=torch.float64)
+        vf, _ = min_norm_point(Af, [di - float(sh) for di, sh in zip(dd, shift)], is_eq)
+        if vf is None:
+            return None, math.inf
+        v = torch.where(fixed, val, vf)
+        hi_v, lo_v = v > Hf + 1e-12, v < Lf - 1e-12
+        if not bool((hi_v | lo_v).any()):
+            return v, float(v.norm())
+        val = torch.where(hi_v, Hf, torch.where(lo_v, Lf, val))
+        fixed = fixed | hi_v | lo_v
+    v = torch.minimum(torch.maximum(v, Lf), Hf)          # residual violations: clip (rare)
+    return v, float(v.norm())
+
+
 def lin_cost(mode: str, t: int, sigma: int, b: float, s: float, s_ref: float, tau: float,
              gb: torch.Tensor, gs: Optional[torch.Tensor], kappa: float = 0.0, mu: float = 0.0
              ) -> Optional[float]:
@@ -152,12 +187,12 @@ def lin_cost(mode: str, t: int, sigma: int, b: float, s: float, s_ref: float, ta
     0 if already successful; None if impossible (prefired tripwire / degenerate)."""
     need = kappa - t * b
     slack = sigma * (s - tau)
-    if mode == "thr" and slack <= mu:
+    if mode in HIDDEN_MODES and slack <= mu:
         return None
     if need <= 0 and (mode != "eq" or s == s_ref):
         return 0.0
     rows, rhs, fl = [_flat(t * gb)], [need], [False]
-    if mode == "thr":
+    if mode in HIDDEN_MODES:
         rows.append(_flat(sigma * gs)); rhs.append(mu - slack); fl.append(False)
     elif mode == "eq":
         rows.append(_flat(gs)); rhs.append(s_ref - s); fl.append(True)
@@ -170,7 +205,9 @@ def lin_cost(mode: str, t: int, sigma: int, b: float, s: float, s_ref: float, ta
 # --------------------------------------------------------------------------- #
 @dataclass
 class AttackCfg:
-    iters: int = 40           # linearise-project iterations (each: 1 forward + 1-2 backward)
+    iters: int = 200          # MAX linearise-project iterations (each: 1 forward + 1-2 backward)
+    patience: int = 30        # stop when the best norm improved < min_rel_improve over this many
+    min_rel_improve: float = 0.005   # iterations after the first success (converged=True)
     eta: float = 1.05         # overshoot on the answer deficit in each linearised step
     alpha_max: float = 0.1    # FAB bias toward the projection of the origin
     beta: float = 0.9         # FAB shrink toward the origin after each successful iterate
@@ -181,6 +218,10 @@ class AttackCfg:
                               # annealed to ~0 over the first 70 % of iterations, so the final
                               # iterates can sit on the probe threshold (the true optimum does)
     eq_tol: float = 0.05      # eq mode: |s - s0| <= eq_tol * class gap
+    pgd_check: bool = True    # free mode: try budgeted PGD at pgd_frac * cost; success means the
+    pgd_frac: float = 0.9     # min-norm attack was not minimal (the cost is then the PGD point's)
+    pgd_steps: int = 40
+    tripwire_fpr: float = 0.05   # "thrq": calibrated tripwire firing on this share of clean images
 
 
 @dataclass
@@ -193,10 +234,22 @@ class Probe:
     method: str = "none"
     keep: float = 1.0
     monitor_acc: float = float("nan")
+    # calibrated tripwire ("thrq" mode): fires on a fraction ``fpr`` of CLEAN monitor images of
+    # the label class. Label 1: fires if s < tau_q1;  label 0: fires if s > tau_q0.
+    tau_q1: Optional[float] = None
+    tau_q0: Optional[float] = None
+    fpr: Optional[float] = None
+
+    def tau_for(self, mode: str, y: int) -> float:
+        if mode == "thrq":
+            q = self.tau_q1 if y == 1 else self.tau_q0
+            return self.tau if q is None else float(q)
+        return self.tau
 
     def meta(self) -> Dict:
         return {"tau": self.tau, "gap": self.gap, "method": self.method, "keep": self.keep,
-                "monitor_acc": self.monitor_acc}
+                "monitor_acc": self.monitor_acc, "tau_q1": self.tau_q1, "tau_q0": self.tau_q0,
+                "fpr": self.fpr}
 
 
 def _flat(x: torch.Tensor) -> torch.Tensor:
@@ -207,20 +260,36 @@ def _norm(x: torch.Tensor) -> float:
     return float(x.double().norm())
 
 
+def _bounds(tgt):
+    f = getattr(tgt, "bounds", None)
+    return f() if f is not None else None
+
+
 def _attack_mode(tgt, mode: str, clean: Dict, cfg: AttackCfg) -> Dict:
     t, sg = tgt.t, tgt.sigma
-    tau, gap = tgt.probe.tau, tgt.probe.gap
+    tau, gap = tgt.probe.tau_for(mode, tgt.y), tgt.probe.gap
     b0, s0 = clean["b"], clean["s"]
     slack0 = sg * (s0 - tau)
+    hidden = mode in HIDDEN_MODES
     cnt = {"n_fwd": 1, "n_bwd": 0}
+    LH = _bounds(tgt)
+
+    def anneal(k):
+        # 1 until the first success, then linearly to 0 over ``patience`` iterations
+        return 1.0 if first_k is None else max(0.0, 1.0 - (k - first_k) / max(1, cfg.patience))
+
     def mu_lin(k):
-        frac = cfg.mu_margin * max(0.0, 1.0 - k / max(1.0, 0.7 * cfg.iters)) + 1e-6
-        return cfg.mu + frac * max(slack0 - cfg.mu, 0.0)
+        # safety margin from the probe threshold, annealed to ~0 (the true optimum sits ON it)
+        return cfg.mu + (cfg.mu_margin * anneal(k) + 1e-6) * max(slack0 - cfg.mu, 0.0)
+
+    def eta_k(k):
+        # overshoot of the answer deficit, annealed to ~1 (the optimum sits ON the answer boundary)
+        return 1.0 + (cfg.eta - 1.0) * anneal(k) + 1e-4
 
     def success(b, s):
         if not (t * b > cfg.kappa):
             return False
-        if mode == "thr":
+        if hidden:
             return sg * (s - tau) > cfg.mu
         if mode == "eq":
             return abs(s - s0) <= cfg.eq_tol * gap
@@ -230,9 +299,11 @@ def _attack_mode(tgt, mode: str, clean: Dict, cfg: AttackCfg) -> Dict:
         out = {"status": status, "cost": cost,
                "cost_rel": (cost / tgt.ref_norm if (cost is not None and tgt.ref_norm > 0) else None)}
         if ev is not None:
+            tq = tgt.probe.tau_for("thrq", tgt.y)
             out.update({"b_final": ev["b"], "s_final": ev["s"], "s_frozen_final": ev["s_frozen"],
-                        # tripwire fires when the probe reads the TARGET class
-                        "fires": bool(sg * (ev["s"] - tau) <= cfg.mu),
+                        # tripwires fire when the probe reads the TARGET class
+                        "fires": bool(sg * (ev["s"] - tgt.probe.tau) <= cfg.mu),
+                        "fires_q": bool(sg * (ev["s"] - tq) <= cfg.mu),
                         "fires_frozen": bool(sg * (ev["s_frozen"] - tgt.frozen.tau) <= cfg.mu),
                         "kept_jaccard": _jaccard(tgt.kept0, ev.get("kept"))})
         out.update(cnt)
@@ -240,16 +311,35 @@ def _attack_mode(tgt, mode: str, clean: Dict, cfg: AttackCfg) -> Dict:
             out.update(extra)
         return out
 
-    if mode == "thr" and slack0 <= cfg.mu:
+    if hidden and slack0 <= cfg.mu:
         return finish("prefired", None, clean)
     if success(b0, s0):
         return finish("prebroken", 0.0, clean)
 
+    def project(rows, c, fl, x):
+        """FAB step: projections of the current point and of the origin onto the
+        linearised constraints (and the box, when there is one)."""
+        A = torch.stack([_flat(r) for r in rows])
+        Ax = (A.double() @ _flat(x).double()).cpu()
+        if LH is None:
+            z, nz = min_norm_point(A, c, fl)
+            yo, nyo = min_norm_point(A, [ci + float(a) for ci, a in zip(c, Ax)], fl)
+        else:
+            L, H = LH
+            xf = _flat(x).double()
+            z, nz = min_norm_point_box(A, c, fl, L.reshape(-1).double() - xf, H.reshape(-1).double() - xf)
+            yo, nyo = min_norm_point_box(A, [ci + float(a) for ci, a in zip(c, Ax)], fl, L, H)
+        return z, nz, yo, nyo
+
     x = tgt.zeros()
     best, best_n, first_k = None, math.inf, None
+    last_improve_k, ref_n = None, math.inf
     trace = []
     cur = clean
+    converged = False
+    k_run = 0
     for k in range(cfg.iters):
+        k_run = k + 1
         if k > 0:
             cur = tgt.evaluate(x, grad=True, need_gs=(mode != "free"))
             cnt["n_fwd"] += 1
@@ -261,32 +351,52 @@ def _attack_mode(tgt, mode: str, clean: Dict, cfg: AttackCfg) -> Dict:
                 best, best_n = x.clone(), n
             if first_k is None:
                 first_k = k
+            if best_n < ref_n * (1 - cfg.min_rel_improve):
+                ref_n, last_improve_k = best_n, k
             x = tgt.box(cfg.beta * x)
         else:
             gb = cur["gb"]
             need = cfg.kappa - t * b
-            rows, c, fl = [t * gb], [need * cfg.eta if need > 0 else need], [False]
-            if mode == "thr":
+            rows, c, fl = [t * gb], [need * eta_k(k) if need > 0 else need], [False]
+            if hidden:
                 rows.append(sg * cur["gs"]); c.append(mu_lin(k) - sg * (s - tau)); fl.append(False)
             elif mode == "eq":
                 rows.append(cur["gs"]); c.append(s0 - s); fl.append(True)
-            A = torch.stack([_flat(r) for r in rows])
-            Ax = (A.double() @ _flat(x).double()).cpu()
-            z, nz = min_norm_point(A, c, fl)                                   # project current point
-            yo, nyo = min_norm_point(A, [ci + float(a) for ci, a in zip(c, Ax)], fl)   # project origin
+            z, nz, yo, nyo = project(rows, c, fl, x)
             if z is None or yo is None:
                 break
             a = min(nz / (nz + nyo + 1e-300), cfg.alpha_max)
             x = tgt.box((1 - a) * (x + z.view_as(x).to(x.dtype)) + a * yo.view_as(x).to(x.dtype))
         if (k + 1) % 10 == 0:
             trace.append(best_n if best is not None else None)
+        if (last_improve_k is not None and k - last_improve_k >= cfg.patience
+                and k - first_k >= 2 * cfg.patience):          # margin annealed, then no progress
+            converged = True
+            break
+    diag = {"first_success_iter": first_k, "trace": trace, "iters_run": k_run, "converged": converged}
     if best is None:
-        return finish("failed", None, cur, {"trace": trace})
-    # ray bisection: smallest c in (0, 1] with success(c * best); hi always verified
+        return finish("failed", None, cur, diag)
+    best, cost, ev_hi, bis = _ray_bisect(tgt, best, success, cfg, cnt)
+    if best is None:
+        return finish("failed", None, ev_hi, dict(diag, why="best not reproducible"))
+    diag["pre_bisect_cost"] = best_n
+    if mode == "free" and cfg.pgd_check:
+        pg = _pgd_check(tgt, cost * cfg.pgd_frac, success, cfg, cnt, LH)
+        diag["pgd_beat"] = pg is not None
+        if pg is not None:                          # PGD found a cheaper verified success
+            pbest, pcost, pev, _ = _ray_bisect(tgt, pg, success, cfg, cnt)
+            if pbest is not None and pcost < cost:
+                diag["cost_minnorm"] = cost
+                cost, ev_hi = pcost, pev
+    return finish("ok", cost, ev_hi, diag)
+
+
+def _ray_bisect(tgt, best, success, cfg, cnt):
+    """Smallest c in (0, 1] with success(c * best); the returned point is verified."""
     ev_hi = tgt.evaluate(best, grad=False, need_gs=False)
     cnt["n_fwd"] += 1
-    if not success(ev_hi["b"], ev_hi["s"]):           # (should not happen: best was verified)
-        return finish("failed", None, ev_hi, {"trace": trace, "why": "best not reproducible"})
+    if not success(ev_hi["b"], ev_hi["s"]):
+        return None, None, ev_hi, None
     lo, hi = 0.0, 1.0
     for _ in range(cfg.bisect):
         mid = 0.5 * (lo + hi)
@@ -296,9 +406,34 @@ def _attack_mode(tgt, mode: str, clean: Dict, cfg: AttackCfg) -> Dict:
             hi, ev_hi = mid, ev
         else:
             lo = mid
-    cost = _norm(tgt.box(hi * best))
-    return finish("ok", cost, ev_hi, {"first_success_iter": first_k, "trace": trace,
-                                      "pre_bisect_cost": best_n})
+    xb = tgt.box(hi * best)
+    return xb, _norm(xb), ev_hi, hi
+
+
+def _pgd_check(tgt, eps, success, cfg, cnt, LH):
+    """Budgeted L2 PGD (normalised-gradient ascent on t*b, projected onto the eps-ball and
+    the box). Returns a verified successful perturbation with norm <= eps, or None."""
+    if not (eps > 0 and math.isfinite(eps)):
+        return None
+    x = tgt.zeros()
+    step = 2.5 * eps / max(1, cfg.pgd_steps)
+    for _ in range(cfg.pgd_steps):
+        ev = tgt.evaluate(x, grad=True, need_gs=False)
+        cnt["n_fwd"] += 1; cnt["n_bwd"] += 1
+        if success(ev["b"], ev["s"]):
+            return x
+        g = tgt.t * ev["gb"].reshape(x.shape).to(x.dtype)
+        gn = float(g.double().norm())
+        if gn == 0:
+            return None
+        x = x + step * g / gn
+        n = float(x.double().norm())
+        if n > eps:
+            x = x * (eps / n)
+        x = tgt.box(x)
+    ev = tgt.evaluate(x, grad=False, need_gs=False)
+    cnt["n_fwd"] += 1
+    return x if success(ev["b"], ev["s"]) else None
 
 
 def _jaccard(a, b) -> Optional[float]:
@@ -325,8 +460,18 @@ def attack_image(tgt, modes: Sequence[str], cfg: AttackCfg) -> Dict:
            "gnorm": gbn, "gsnorm": gsn,
            "cos_bs": float((_flat(gb).double() @ _flat(gs).double()) / max(gbn * gsn, 1e-300)),
            "ref_norm": tgt.ref_norm, "dim": int(gb.numel())}
-    rec["lin"] = {m: lin_cost(m, t, sg, clean["b"], clean["s"], clean["s"], tgt.probe.tau, gb, gs,
-                              cfg.kappa, cfg.mu) for m in MODES}
+    rec["lin"] = {m: lin_cost(m, t, sg, clean["b"], clean["s"], clean["s"], tgt.probe.tau_for(m, tgt.y),
+                              gb, gs, cfg.kappa, cfg.mu) for m in MODES}
+    rec["slack0_q"] = sg * (clean["s"] - tgt.probe.tau_for("thrq", tgt.y))
+    LH = _bounds(tgt)
+    if LH is not None:
+        # share of the clean gradient's energy on coordinates the box blocks (pixel at a bound
+        # and the target direction pushes it outward): high values are what stalled v3.0
+        L, H = LH
+        g = _flat(t * gb).double()
+        blk = ((_flat(H).double() <= 1e-12) & (g > 0)) | ((_flat(L).double() >= -1e-12) & (g < 0))
+        rec["blocked_grad_frac"] = float((g[blk] ** 2).sum() / max(float((g ** 2).sum()), 1e-300))
+        rec["blocked_coord_frac"] = float(blk.double().mean())
     rec["modes"] = {m: _attack_mode(tgt, m, clean, cfg) for m in modes}
     rec["seconds"] = time.time() - t0
     return rec
@@ -339,7 +484,8 @@ class LinearTarget:
     """Synthetic target for checks: b(x) = w.x + b0 (+ curv * (q.x)^2), s(x) = v.x + s0.
     With curv = 0 the true minimum norms equal ``lin_cost`` exactly."""
 
-    def __init__(self, w, v, b0, s0, y, tau=0.0, gap=1.0, curv=0.0, q=None, ref_norm=1.0):
+    def __init__(self, w, v, b0, s0, y, tau=0.0, gap=1.0, curv=0.0, q=None, ref_norm=1.0,
+                 lo=None, hi=None):
         self.w = torch.as_tensor(w, dtype=torch.float64)
         self.v = torch.as_tensor(v, dtype=torch.float64)
         self.q = torch.as_tensor(q if q is not None else np.zeros(len(w)), dtype=torch.float64)
@@ -349,12 +495,19 @@ class LinearTarget:
         self.frozen = self.probe
         self.kept0 = None
         self.ref_norm = float(ref_norm)
+        self._lo = None if lo is None else torch.as_tensor(lo, dtype=torch.float64)
+        self._hi = None if hi is None else torch.as_tensor(hi, dtype=torch.float64)
 
     def zeros(self):
         return torch.zeros_like(self.w)
 
+    def bounds(self):
+        return None if self._lo is None else (self._lo, self._hi)
+
     def box(self, x):
-        return x
+        if self._lo is None:
+            return x
+        return torch.minimum(torch.maximum(x, self._lo), self._hi)
 
     def evaluate(self, x, grad=False, need_gs=False):
         x = x.detach().double().requires_grad_(grad)
@@ -460,6 +613,16 @@ class VLMTarget:
     def zeros(self) -> torch.Tensor:
         return torch.zeros(self.shape, dtype=torch.float32, device=self.device)
 
+    def bounds(self):
+        """(L, H) bounds on the PERTURBATION (pixel leaf), or None."""
+        if self.box_lohi is None:
+            return None
+        if not hasattr(self, "_LH"):
+            lo, hi = self.box_lohi
+            pv = self.inp["pixel_values"].float()
+            self._LH = ((lo.float() - pv).clamp(max=0.0), (hi.float() - pv).clamp(min=0.0))
+        return self._LH
+
     def box(self, x: torch.Tensor) -> torch.Tensor:
         if self.box_lohi is None:
             return x
@@ -525,7 +688,7 @@ class VLMTarget:
 # --------------------------------------------------------------------------- #
 # probes and orchestration
 # --------------------------------------------------------------------------- #
-def fit_probe(coll, method: str, keep: float) -> Probe:
+def fit_probe(coll, method: str, keep: float, fpr: float = 0.05) -> Probe:
     """Rank-1 class-mean tripwire on the monitor split (disjoint from the attacked
     images), fit on reads compressed with (method, keep) -- the refit defender.
     method='none' / keep=1 gives the frozen (pre-compression) probe."""
@@ -541,8 +704,11 @@ def fit_probe(coll, method: str, keep: float) -> Probe:
     gap = float(np.linalg.norm(d))
     u = d / max(gap, 1e-12)
     tau = float(u @ (0.5 * (mu1 + mu0)))
-    acc = float(np.mean(((H @ u) > tau) == (y == 1)))
-    return Probe(u=u, tau=tau, gap=gap, method=m, keep=k, monitor_acc=acc)
+    sc = H @ u
+    acc = float(np.mean((sc > tau) == (y == 1)))
+    return Probe(u=u, tau=tau, gap=gap, method=m, keep=k, monitor_acc=acc,
+                 tau_q1=float(np.quantile(sc[y == 1], fpr)), tau_q0=float(np.quantile(sc[y == 0], 1 - fpr)),
+                 fpr=float(fpr))
 
 
 def _cells(keeps, methods, selections):
@@ -616,12 +782,12 @@ def run_attacks(coll, *, leaf: str, keeps=DEFAULT_KEEPS, methods=DEFAULT_METHODS
         elif verbose:
             print("[attack][warn] existing results have a different setup; starting fresh")
     t_start = time.time()
-    frozen = fit_probe(coll, "none", 1.0)
+    frozen = fit_probe(coll, "none", 1.0, cfg.tripwire_fpr)
     R["probes"]["none@1.0"] = frozen.meta()
     probe_cache: Dict = {("none", 1.0): frozen}
     for (m, k, sel) in _cells(keeps, methods, selections):
         if (m, k) not in probe_cache:
-            probe_cache[(m, k)] = frozen if monitor == "frozen" else fit_probe(coll, m, k)
+            probe_cache[(m, k)] = frozen if monitor == "frozen" else fit_probe(coll, m, k, cfg.tripwire_fpr)
             R["probes"][f"{m}@{k}"] = probe_cache[(m, k)].meta()
         probe = probe_cache[(m, k)]
         errs = 0

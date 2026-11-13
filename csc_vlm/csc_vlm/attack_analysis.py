@@ -125,7 +125,10 @@ def rows_of(R: Dict) -> List[Dict]:
                         "cost_rel": mr.get("cost_rel"),
                         "lin": (r.get("lin") or {}).get(mode),
                         "fires": mr.get("fires"), "fires_frozen": mr.get("fires_frozen"),
-                        "jac": mr.get("kept_jaccard"), "margin0": r.get("margin0")})
+                        "jac": mr.get("kept_jaccard"), "margin0": r.get("margin0"),
+                        "fires_q": mr.get("fires_q"), "converged": mr.get("converged"),
+                        "iters": mr.get("iters_run"), "pgd_beat": mr.get("pgd_beat"),
+                        "blocked": r.get("blocked_grad_frac")})
     return out
 
 
@@ -198,13 +201,22 @@ def _cost_block(rows, m, sel, modes, keeps, budgets) -> Dict:
                                                         for r in v])),
                          "success_at": {f"{q}": float(np.mean(eff <= b)) for q, b in budgets.items()}}
             row["ak"] = float(np.median([r["ak"] for r in v]))
-        if {"free", "thr"} <= set(modes):
-            T = _ratio_rows(rows, m, sel, k)
-            if T:
-                row["T_true_median"] = float(np.median(T))
-                row["T_true_n"] = len(T)
-                # true minima satisfy OC_thr >= OC_free; T < 1 flags a sub-optimal free attack
-                row["T_below_1"] = float(np.mean(np.asarray(T) < 1 - 1e-3))
+        for hm in ("thr", "thrq"):
+            if {"free", hm} <= set(modes):
+                T = _ratio_rows(rows, m, sel, k, hm)
+                if T:
+                    T = np.asarray(T)
+                    row[f"T_{hm}"] = {"median": float(np.median(T)), "n": int(len(T)),
+                                      # the tripwire BINDS (costs the attacker > 1 %) in this share
+                                      "binding": float(np.mean(T > 1.01)),
+                                      # true minima satisfy OC_thr >= OC_free; T < 1 = sub-optimal free attack
+                                      "below_1": float(np.mean(T < 1 - 1e-3))}
+        ok = [r for r in _view(rows, m, sel) if abs(r["keep"] - k) < 1e-12 and r["status"] == "ok"]
+        if ok:
+            row["converged"] = float(np.mean([bool(r["converged"]) for r in ok if r["converged"] is not None]
+                                             or [np.nan]))
+            pb = [bool(r["pgd_beat"]) for r in ok if r["pgd_beat"] is not None]
+            row["pgd_beat"] = float(np.mean(pb)) if pb else float("nan")
         res["per_keep"].append(row)
     # paired slopes on finite positive costs
     for mode in modes:
@@ -219,10 +231,11 @@ def _cost_block(rows, m, sel, modes, keeps, budgets) -> Dict:
                     res["by_direction"].setdefault(f"y={yv}", {})[f"log_{mode}"] = st.paired_slope(
                         np.log([r["ak"] for r in vy]), np.log([r["cost"] for r in vy]),
                         [r["image"] for r in vy])
-    if {"free", "thr"} <= set(modes):
-        dec = _decomposition(rows, m, sel)
-        if dec:
-            res["decomposition"] = dec
+    for hm in ("thr", "thrq"):
+        if {"free", hm} <= set(modes):
+            dec = _decomposition(rows, m, sel, hm)
+            if dec:
+                res[f"decomposition_{hm}"] = dec
     return res
 
 
@@ -237,17 +250,17 @@ def _pairs(rows, m, sel, k=None):
     return d
 
 
-def _ratio_rows(rows, m, sel, k) -> List[float]:
-    return [p["thr"]["cost"] / p["free"]["cost"] for p in _pairs(rows, m, sel, k).values()
-            if "thr" in p and "free" in p]
+def _ratio_rows(rows, m, sel, k, hm="thr") -> List[float]:
+    return [p[hm]["cost"] / p["free"]["cost"] for p in _pairs(rows, m, sel, k).values()
+            if hm in p and "free" in p]
 
 
-def _decomposition(rows, m, sel) -> Optional[Dict]:
-    P = [p for p in _pairs(rows, m, sel).values() if "thr" in p and "free" in p]
+def _decomposition(rows, m, sel, hm="thr") -> Optional[Dict]:
+    P = [p for p in _pairs(rows, m, sel).values() if hm in p and "free" in p]
     if len(P) < 3:
         return None
     x = np.log([p["free"]["ak"] for p in P]); g = [p["free"]["image"] for p in P]
-    lf = np.log([p["free"]["cost"] for p in P]); lt = np.log([p["thr"]["cost"] for p in P])
+    lf = np.log([p["free"]["cost"] for p in P]); lt = np.log([p[hm]["cost"] for p in P])
     return st.decompose(x, {"log_oc": lt, "log_free": lf, "log_T": lt - lf}, g)
 
 
@@ -271,6 +284,8 @@ def _incidental(rows, m, sel, keeps) -> Dict:
             continue
         per.append({"keep": k,
                     "refit": wilson(sum(bool(r["fires"]) for r in vk), len(vk)),
+                    "refit_q": wilson(sum(bool(r["fires_q"]) for r in vk if r["fires_q"] is not None),
+                                      sum(r["fires_q"] is not None for r in vk)),
                     "frozen": wilson(sum(bool(r["fires_frozen"]) for r in vk), len(vk))})
     out = {"per_keep": per}
     if len(keeps) > 1:
@@ -320,9 +335,10 @@ def _steering(rows, m, modes, keeps, budgets) -> Dict:
                          "jaccard_live_median": float(np.median([lv[i]["jac"] for i in common
                                                                  if lv[i]["jac"] is not None]))
                          if any(lv[i]["jac"] is not None for i in common) else float("nan")}
-        if "thr" in logs and "free" in logs:
-            com = sorted(set(logs["thr"]) & set(logs["free"]))
-            blk["R2_index"] = _boot_mean([logs["thr"][i] - logs["free"][i] for i in com])
+        for hm in ("thr", "thrq"):
+            if hm in logs and "free" in logs:
+                com = sorted(set(logs[hm]) & set(logs["free"]))
+                blk[f"R2_index_{hm}"] = _boot_mean([logs[hm][i] - logs["free"][i] for i in com])
         if blk:
             out[f"{k}"] = blk
     return out
@@ -341,6 +357,13 @@ def analyze_attack(R: Dict) -> Dict:
          "n_records": len([r for r in R["records"] if "modes" in r]),
          "n_errors": len([r for r in R["records"] if "error" in r]),
          "complete": R.get("complete", False)}
+    bl = [r["blocked"] for r in rows if r["mode"] == "free" and r["blocked"] is not None]
+    S["diagnostics"] = {
+        "converged": float(np.mean([bool(r["converged"]) for r in rows
+                                    if r["status"] == "ok" and r["converged"] is not None] or [np.nan])),
+        "failed": float(np.mean([r["status"] == "failed" for r in rows])),
+        "pgd_beat": float(np.mean([bool(r["pgd_beat"]) for r in rows if r["pgd_beat"] is not None] or [np.nan])),
+        "blocked_grad_frac_median": float(np.median(bl)) if bl else float("nan")}
     S["instrument"] = _instrument(rows, methods, modes, keeps)
     S["instrument_pass"] = {}
     for mode in modes:
@@ -379,6 +402,10 @@ def format_attack(S: Dict) -> str:
          "complete=" + str(S["complete"]),
          "  beta = d log X / d log(kept fraction); beta>0: X FALLS under compression; * = 95% CI excludes 0",
          "  budgets (keep-1 OC_free quantiles): " + ", ".join(f"{k}={v:.3g}" for k, v in S["budgets"].items())]
+    dg = S["diagnostics"]
+    L.append(f"  OPTIMISER: converged {dg['converged']:.2f} of successes | failed {dg['failed']:.2f} of attacks | "
+             f"PGD beat min-norm in {dg['pgd_beat']:.2f} of free attacks | median blocked-gradient share "
+             f"{dg['blocked_grad_frac_median']:.2f}  (trust slopes only if converged ~1, failed ~0, pgd_beat ~0)")
     L.append("\n[1] INSTRUMENT (frozen selection): Spearman(lin, true) per keep; slope of log(true/lin)")
     for key, v in S["instrument"].items():
         per = "  ".join(f"k={p['keep']:.3g}:rho={p['spearman']:.2f},ratio={p['ratio_median']:.2f}(n={p['n']})"
@@ -395,24 +422,29 @@ def format_attack(S: Dict) -> str:
                 if mode in row:
                     q = row[mode]
                     parts.append(f"{mode}: med={q['median']:.3g} pre={q['prebroken']:.2f} fail={q['failed']:.2f}"
-                                 + (f" fired={q['prefired']:.2f}" if mode == "thr" else "")
+                                 + (f" fired={q['prefired']:.2f}" if mode in ("thr", "thrq") else "")
                                  + " P(<=q50)=" + f"{q['success_at'].get('q50', float('nan')):.2f}")
-            if "T_true_median" in row:
-                parts.append(f"T_true={row['T_true_median']:.3f}(n={row['T_true_n']},"
-                             f" T<1:{row['T_below_1']:.2f})")
+            for hm in ("thr", "thrq"):
+                if f"T_{hm}" in row:
+                    q = row[f"T_{hm}"]
+                    parts.append(f"T_{hm}={q['median']:.3f}(n={q['n']}, binds:{q['binding']:.2f}, T<1:{q['below_1']:.2f})")
+            if "converged" in row:
+                parts.append(f"conv={row['converged']:.2f} pgd_beat={row['pgd_beat']:.2f}")
             L.append("    " + " | ".join(parts))
         sl = c["slopes"]
         L.append("    slopes: " + "  ".join(f"{k}={_fs(v)}" for k, v in sl.items()))
-        if "decomposition" in c:
-            d = c["decomposition"]
-            L.append(f"    exact split: log OC_thr {_fs(d['log_oc'])} = log OC_free {_fs(d['log_free'])} "
-                     f"+ log T_true {_fs(d['log_T'])}  (recon err {d['recon_error']:.1e})")
+        for hm in ("thr", "thrq"):
+            if f"decomposition_{hm}" in c:
+                d = c[f"decomposition_{hm}"]
+                L.append(f"    exact split: log OC_{hm} {_fs(d['log_oc'])} = log OC_free {_fs(d['log_free'])} "
+                         f"+ log T_{hm} {_fs(d['log_T'])}  (recon err {d['recon_error']:.1e})")
         for dkey, dv in c["by_direction"].items():
             L.append(f"    {dkey}: " + "  ".join(f"{k}={_fs(v)}" for k, v in dv.items()))
     L.append("\n[3] INCIDENTAL DETECTION: P(tripwire fires | plain attack succeeded)")
     for key, inc in S["incidental"].items():
         per = "  ".join(f"k={p['keep']:.3g}: refit {p['refit']['p']:.2f}[{p['refit']['lo']:.2f},{p['refit']['hi']:.2f}]"
-                        f"(n={p['refit']['n']}) frozen {p['frozen']['p']:.2f}" for p in inc["per_keep"])
+                        f"(n={p['refit']['n']}) calibrated {p['refit_q']['p']:.2f} frozen {p['frozen']['p']:.2f}"
+                        for p in inc["per_keep"])
         L.append(f"  [{key}] {per}")
         if "paired_diff_refit" in inc:
             L.append(f"      paired (k_min - k_1): refit {_fm(inc['paired_diff_refit'])}  "
@@ -429,7 +461,8 @@ def format_attack(S: Dict) -> str:
                         L.append(f"      {mode}: selection changed in {b[mode]['frac_selection_changed']:.2f} of pairs;"
                                  f" changed {_fm(b[mode]['log_ratio_selection_changed'])}"
                                  f" vs unchanged (noise floor) {_fm(b[mode]['log_ratio_selection_same'])}")
-                if "R2_index" in b:
-                    L.append(f"      R2 index (steering helps the HIDDEN attack beyond the plain one): "
-                             f"{_fm(b['R2_index'])}")
+                for hm in ("thr", "thrq"):
+                    if f"R2_index_{hm}" in b:
+                        L.append(f"      R2 index {hm} (steering helps the HIDDEN attack beyond the plain one): "
+                                 f"{_fm(b[f'R2_index_{hm}'])}")
     return "\n".join(L)

@@ -141,6 +141,47 @@ def test_attack_matches_closed_form_on_linear_targets():
             assert -1e-6 <= r["cost"] / rec["lin"][m] - 1 < 3e-3
 
 
+def test_box_saturated_gradient_does_not_stall():
+    """v3.0 regression (the pixel-run stall): most of the gradient on coordinates already
+    at a box bound. The box-aware projection must reach the exact constrained minimum."""
+    from csc_vlm.attack import AttackCfg, LinearTarget, attack_image
+    rng = np.random.default_rng(3)
+    for _ in range(5):
+        D = 300
+        w = rng.normal(size=D) * 0.05
+        blk = rng.choice(D, 30, replace=False)
+        w[blk] = rng.uniform(2, 4, size=30)
+        hi = np.full(D, 1.0); hi[blk] = 0.0
+        tg = LinearTarget(w, rng.normal(size=D), b0=-2.0, s0=-1.0, y=0, lo=np.full(D, -1.0), hi=hi)
+        rec = attack_image(tg, ("free", "thr"), AttackCfg())
+        r = rec["modes"]["free"]
+        assert r["status"] == "ok" and r["converged"]
+        exact = 2.0 / np.linalg.norm(np.delete(w, blk))
+        assert -1e-6 <= r["cost"] / exact - 1 < 1e-3
+        assert rec["blocked_grad_frac"] > 0.9
+
+
+def test_calibrated_tripwire_closed_form_and_ordering():
+    from csc_vlm.attack import AttackCfg, LinearTarget, attack_image
+    rng = np.random.default_rng(4)
+    for _ in range(10):
+        D = 24
+        w = rng.normal(size=D); v = rng.normal(size=D) + rng.uniform(-1, 1) * w
+        y = int(rng.integers(0, 2)); t, sg = -(2 * y - 1), 2 * y - 1
+        tg = LinearTarget(w, v, -t * rng.uniform(0.5, 4), sg * rng.uniform(0.5, 2), y)
+        tg.probe.tau_q1, tg.probe.tau_q0 = 0.3, -0.3
+        rec = attack_image(tg, ("free", "thr", "thrq"), AttackCfg())
+        for m in ("thr", "thrq"):
+            r = rec["modes"][m]
+            if r["status"] == "ok":
+                assert -1e-6 <= r["cost"] / rec["lin"][m] - 1 < 1e-3
+        c = {m: rec["modes"][m]["cost"] for m in ("free", "thr", "thrq") if rec["modes"][m]["status"] == "ok"}
+        if "thr" in c and "free" in c:
+            assert c["thr"] >= c["free"] * (1 - 1e-4)          # a constraint can only add cost
+        if "thrq" in c and "thr" in c:
+            assert c["thrq"] >= c["thr"] * (1 - 1e-4)          # a stricter tripwire can only add cost
+
+
 def test_attack_close_to_brute_force_on_curved_targets():
     from csc_vlm.attack import AttackCfg, LinearTarget, attack_image
     rng = np.random.default_rng(2)
@@ -183,8 +224,8 @@ def test_run_attacks_end_to_end(handle, leaf, tmp_path):
     coll = _coll(handle, n_eval=4, n_mon=12)
     out = str(tmp_path / "a.json")
     R = run_attacks(coll, leaf=leaf, keeps=(1.0, 0.5), methods=("pool", "drop_norm"),
-                    selections=("frozen", "live"), modes=("free", "thr", "eq"), n_images=3,
-                    cfg=AttackCfg(iters=12, bisect=6), out_path=out, verbose=False)
+                    selections=("frozen", "live"), modes=("free", "thr", "thrq", "eq"), n_images=3,
+                    cfg=AttackCfg(iters=12, bisect=6, patience=4, pgd_steps=5), out_path=out, verbose=False)
     assert R["complete"]
     recs = [r for r in R["records"] if "modes" in r]
     # cells: none@1 + pool@.5 frozen + drop_norm@.5 frozen/live = 4 cells x 3 images
@@ -198,10 +239,12 @@ def test_run_attacks_end_to_end(handle, leaf, tmp_path):
                 assert t * mr["b_final"] > 0                      # verified: answer is the target
                 if m == "thr":
                     assert not mr["fires"]                         # verified: tripwire silent
+                if m == "thrq":
+                    assert not mr["fires_q"]                       # verified: calibrated tripwire silent
     # resume: rerunning does no new work
     R2 = run_attacks(coll, leaf=leaf, keeps=(1.0, 0.5), methods=("pool", "drop_norm"),
-                     selections=("frozen", "live"), modes=("free", "thr", "eq"), n_images=3,
-                     cfg=AttackCfg(iters=12, bisect=6), out_path=out, verbose=False)
+                     selections=("frozen", "live"), modes=("free", "thr", "thrq", "eq"), n_images=3,
+                     cfg=AttackCfg(iters=12, bisect=6, patience=4, pgd_steps=5), out_path=out, verbose=False)
     assert len(R2["records"]) == 12
     S = analyze_attack(R)
     assert isinstance(format_attack(S), str) and S["n_records"] == 12

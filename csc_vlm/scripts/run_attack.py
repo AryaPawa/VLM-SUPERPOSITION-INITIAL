@@ -90,6 +90,45 @@ def _self_check() -> bool:
     print(f"[self-check] attack == closed form on linear targets (worst rel. err {worst:.1e}): "
           f"{'PASS' if worst < 3e-3 else 'FAIL'}")
 
+    # (b2) v3.0 regression: gradient concentrated on box-saturated coordinates (the pixel stall)
+    worst_box = 0.0
+    for trial in range(5):
+        D = 300
+        w = rng.normal(size=D) * 0.05
+        blk = rng.choice(D, 30, replace=False)
+        w[blk] = rng.uniform(2, 4, size=30)
+        hi = np.full(D, 1.0); hi[blk] = 0.0
+        tg = LinearTarget(w, rng.normal(size=D), b0=-2.0, s0=-1.0, y=0, lo=np.full(D, -1.0), hi=hi)
+        r = attack_image(tg, ("free",), AttackCfg())["modes"]["free"]
+        exact = 2.0 / np.linalg.norm(np.delete(w, blk))
+        rel = (r["cost"] / exact - 1) if r["status"] == "ok" else math.inf
+        worst_box = max(worst_box, abs(rel))
+    good = worst_box < 3e-3
+    ok &= good
+    print(f"[self-check] box-aware projection on saturated coordinates (worst rel. err {worst_box:.1e}): "
+          f"{'PASS' if good else 'FAIL'}")
+    # (b3) calibrated tripwire (thrq) reproduces its closed form
+    worst_q = 0.0
+    for trial in range(10):
+        D = 24
+        w = rng.normal(size=D); v = rng.normal(size=D) + rng.uniform(-1, 1) * w
+        y = int(rng.integers(0, 2)); t, sg = -(2 * y - 1), 2 * y - 1
+        tg = LinearTarget(w, v, -t * rng.uniform(0.5, 4), sg * rng.uniform(0.5, 2), y)
+        tg.probe.tau_q1, tg.probe.tau_q0 = 0.3, -0.3          # stricter than the midpoint (0)
+        rec = attack_image(tg, ("thr", "thrq"), AttackCfg())
+        for md in ("thr", "thrq"):
+            r = rec["modes"][md]
+            if r["status"] == "ok":
+                worst_q = max(worst_q, abs(r["cost"] / rec["lin"][md] - 1))
+            elif r["status"] != "prefired":
+                worst_q = math.inf
+        if rec["modes"]["thrq"]["status"] == "ok" and rec["modes"]["thr"]["status"] == "ok":
+            if rec["modes"]["thrq"]["cost"] < rec["modes"]["thr"]["cost"] * (1 - 3e-3):
+                worst_q = math.inf                               # stricter tripwire cannot be cheaper
+    good = worst_q < 3e-3
+    ok &= good
+    print(f"[self-check] calibrated tripwire == closed form, never cheaper than midpoint: {'PASS' if good else 'FAIL'}")
+
     # (c) analysis on synthetic records with KNOWN effects
     R = {"leaf": "patch", "methods": ["pool", "drop_norm"], "modes": ["free", "thr"], "records": [],
          "complete": True}
@@ -120,11 +159,11 @@ def _self_check() -> bool:
                 and S["instrument_pass"].get("thr") == "PASS"))
     chk.append(("log OC_free slope ~ +0.30", abs(c["slopes"]["log_free"]["slope"] - 0.3) < 0.02))
     chk.append(("log OC_thr slope ~ +0.10", abs(c["slopes"]["log_thr"]["slope"] - 0.1) < 0.02))
-    chk.append(("log T_true slope ~ -0.20", abs(c["decomposition"]["log_T"]["slope"] + 0.2) < 0.02))
-    chk.append(("exact split", abs(c["decomposition"]["recon_error"]) < 1e-9))
+    chk.append(("log T_true slope ~ -0.20", abs(c["decomposition_thr"]["log_T"]["slope"] + 0.2) < 0.02))
+    chk.append(("exact split", abs(c["decomposition_thr"]["recon_error"]) < 1e-9))
     st_ = S["steering"]["drop_norm"]["0.0625"]
     chk.append(("steering thr = log(1/0.8)", abs(st_["thr"]["log_ratio"]["mean"] - math.log(1 / 0.8)) < 0.02))
-    chk.append(("R2 index ~ 0.172", abs(st_["R2_index"]["mean"] - (math.log(1 / 0.8) - math.log(1 / 0.95))) < 0.02))
+    chk.append(("R2 index ~ 0.172", abs(st_["R2_index_thr"]["mean"] - (math.log(1 / 0.8) - math.log(1 / 0.95))) < 0.02))
     inc = S["incidental"]["pool|frozen"]["paired_diff_refit"]["mean"]
     chk.append(("incidental paired diff = +0.25", abs(inc - 0.25) < 1e-9))
     for name, good in chk:
@@ -142,14 +181,18 @@ def main():
     ap.add_argument("--model-id", default="")
     ap.add_argument("--dataset", default="coco:bottle:data/concept_bottle")
     ap.add_argument("--leaf", default="patch", choices=list(LEAVES))
-    ap.add_argument("--modes", default="free,thr,eq")
+    ap.add_argument("--modes", default="free,thr,thrq,eq",
+                    help="free | thr (midpoint tripwire) | thrq (calibrated tripwire, --fpr) | eq")
     ap.add_argument("--selections", default="frozen,live")
     ap.add_argument("--methods", default=",".join(DEFAULT_METHODS))
     ap.add_argument("--keeps", default=",".join(str(k) for k in DEFAULT_KEEPS))
     ap.add_argument("--n-images", type=int, default=32)
     ap.add_argument("--n-monitor", type=int, default=144)
     ap.add_argument("--per-class", type=int, default=300)
-    ap.add_argument("--iters", type=int, default=40)
+    ap.add_argument("--iters", type=int, default=200, help="max iterations (early stop on convergence)")
+    ap.add_argument("--patience", type=int, default=30)
+    ap.add_argument("--fpr", type=float, default=0.05, help="calibrated tripwire false-positive rate")
+    ap.add_argument("--no-pgd-check", action="store_true")
     ap.add_argument("--bisect", type=int, default=10)
     ap.add_argument("--monitor", default="refit", choices=["refit", "frozen"],
                     help="probe the attacker must evade: refit per (method, keep) or the keep-1 probe")
@@ -186,7 +229,8 @@ def main():
     sels = [s.strip() for s in args.selections.split(",") if s.strip()]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     keeps = [float(k) for k in args.keeps.split(",") if k.strip()]
-    cfg = AttackCfg(iters=args.iters, bisect=args.bisect)
+    cfg = AttackCfg(iters=args.iters, bisect=args.bisect, patience=args.patience,
+                    tripwire_fpr=args.fpr, pgd_check=not args.no_pgd_check)
 
     images, labels = load_images(args.dataset, per_class=args.per_class, seed=args.seed)
     s0cfg = Stage0Config(model=args.model, model_id=args.model_id, dataset=args.dataset,
