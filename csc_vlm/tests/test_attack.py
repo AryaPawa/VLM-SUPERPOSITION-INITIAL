@@ -268,3 +268,30 @@ def test_pixel_box_qwen_layout():
     assert torch.allclose(lo[0, per:2 * per], torch.full((per,), (0 - 0.4) / 0.25))
     assert torch.allclose(hi[0, 2 * per:], torch.full((per,), (1 - 0.3) / 0.3))
     assert pixel_box(H, pv + 100.0) is None                 # outside the inferred box -> refuse
+
+
+def test_qwen_temporal_copies_are_tied():
+    """Qwen2-VL tiles each image into identical temporal frames inside pixel_values; a real
+    image attacker perturbs all copies identically. Detection + exact projection."""
+    from csc_vlm.attack import temporal_tie_layout, tie_project
+
+    class IP:
+        image_mean = [0.5, 0.4, 0.3]
+        image_std = [0.2, 0.25, 0.3]
+        temporal_patch_size = 2
+        patch_size = 4
+
+    class H:
+        class processor:
+            image_processor = IP
+    n, C, Tp, PP = 10, 3, 2, 16
+    base = torch.randn(n, C, 1, PP).expand(n, C, Tp, PP).reshape(n, C * Tp * PP)
+    lay = temporal_tie_layout(H, base)
+    assert lay == (C, Tp, PP)
+    assert temporal_tie_layout(H, torch.randn(n, C * Tp * PP)) is None      # copies differ -> no tie
+    g = torch.randn(n, C * Tp * PP)
+    pg = tie_project(g, lay)
+    v = pg.reshape(n, C, Tp, PP)
+    assert torch.allclose(v[:, :, 0], v[:, :, 1])                             # tied
+    assert torch.allclose(tie_project(pg, lay), pg)                           # idempotent
+    assert abs(float((g - pg).reshape(-1) @ pg.reshape(-1))) < 1e-4           # orthogonal projection

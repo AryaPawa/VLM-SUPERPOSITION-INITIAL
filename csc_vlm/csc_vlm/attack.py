@@ -83,7 +83,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 
-__all__ = ["MODES", "HIDDEN_MODES", "LEAVES", "SELECTIONS", "SELECTION_METHODS", "DEFAULT_KEEPS",
+__all__ = ["temporal_tie_layout", "tie_project", "MODES", "HIDDEN_MODES", "LEAVES", "SELECTIONS", "SELECTION_METHODS", "DEFAULT_KEEPS",
            "DEFAULT_METHODS", "AttackCfg", "Probe", "min_norm_point", "lin_cost",
            "attack_image", "fit_probe", "pixel_box", "VLMTarget", "LinearTarget",
            "run_attacks"]
@@ -219,7 +219,9 @@ class AttackCfg:
                               # iterates can sit on the probe threshold (the true optimum does)
     eq_tol: float = 0.05      # eq mode: |s - s0| <= eq_tol * class gap
     pgd_check: bool = True    # free mode: try budgeted PGD at pgd_frac * cost; success means the
-    pgd_frac: float = 0.9     # min-norm attack was not minimal (the cost is then the PGD point's)
+    pgd_frac: float = 0.9     # min-norm attack was not minimal. DIAGNOSTIC ONLY: the reported cost
+                              # stays the min-norm one, so free and hidden modes are optimised
+                              # identically and T_true = OC_thr / OC_free is not biased
     pgd_steps: int = 40
     tripwire_fpr: float = 0.05   # "thrq": calibrated tripwire firing on this share of clean images
 
@@ -383,11 +385,9 @@ def _attack_mode(tgt, mode: str, clean: Dict, cfg: AttackCfg) -> Dict:
     if mode == "free" and cfg.pgd_check:
         pg = _pgd_check(tgt, cost * cfg.pgd_frac, success, cfg, cnt, LH)
         diag["pgd_beat"] = pg is not None
-        if pg is not None:                          # PGD found a cheaper verified success
-            pbest, pcost, pev, _ = _ray_bisect(tgt, pg, success, cfg, cnt)
-            if pbest is not None and pcost < cost:
-                diag["cost_minnorm"] = cost
-                cost, ev_hi = pcost, pev
+        if pg is not None:                          # record how much cheaper; do NOT substitute
+            _, pcost, _, _ = _ray_bisect(tgt, pg, success, cfg, cnt)
+            diag["pgd_cost"] = pcost
     return finish("ok", cost, ev_hi, diag)
 
 
@@ -548,6 +548,34 @@ def pixel_box(handle, pv: torch.Tensor):
     return lo.to(pv.dtype), hi.to(pv.dtype)
 
 
+def temporal_tie_layout(handle, pv: torch.Tensor):
+    """Qwen2-VL-family processors tile each IMAGE into ``temporal_patch_size`` identical
+    frames inside the flattened pixel_values [n_patches, C * T * P * P]. An attacker on a
+    real image must perturb every copy identically. Returns (C, T, P*P) when that layout
+    is detected AND the clean copies are verified identical, else None."""
+    ip = getattr(getattr(handle, "processor", None), "image_processor", None)
+    Tp, P = getattr(ip, "temporal_patch_size", None), getattr(ip, "patch_size", None)
+    mean = getattr(ip, "image_mean", None)
+    C = len(mean) if mean is not None else 3
+    if pv.dim() != 2 or not Tp or not P or int(Tp) < 2 or pv.shape[1] != C * int(Tp) * int(P) ** 2:
+        return None
+    v = pv.reshape(pv.shape[0], C, int(Tp), int(P) ** 2).float()
+    if not bool(torch.allclose(v, v[:, :, :1].expand_as(v), atol=1e-6)):
+        return None
+    return (C, int(Tp), int(P) ** 2)
+
+
+def tie_project(g: torch.Tensor, tie) -> torch.Tensor:
+    """Orthogonal projection onto 'identical perturbation in every temporal copy' (average
+    over the copies). With the gradients projected, every min-norm step and every PGD step
+    stays in that subspace, and the box (identical for identical clean copies) preserves it."""
+    if tie is None:
+        return g
+    C, Tp, PP = tie
+    v = g.reshape(g.shape[0], C, Tp, PP)
+    return v.mean(2, keepdim=True).expand_as(v).reshape(g.shape).contiguous()
+
+
 def _kept(plan) -> Optional[List[int]]:
     if plan is None or plan.method not in ("drop_norm", "drop_query", "drop_random", "mask_norm"):
         return None
@@ -605,6 +633,7 @@ class VLMTarget:
             self.shape, self.device = tuple(pv.shape), pv.device
             self.ref_norm = _norm(pv)
             self.box_lohi = pixel_box(self.h, pv)
+            self.tie = temporal_tie_layout(self.h, pv)
 
     def _plan(self, e, rr, scores):
         return self._build_plan(self.method, self.keep, self.T, rr, e, scores=scores,
@@ -624,11 +653,13 @@ class VLMTarget:
         return self._LH
 
     def box(self, x: torch.Tensor) -> torch.Tensor:
-        if self.box_lohi is None:
+        """Clamp the PERTURBATION to [L, H] (L <= 0 <= H): the zero perturbation is always
+        kept exactly, even for clean pixels a hair outside the inferred valid range."""
+        LH = self.bounds()
+        if LH is None:
             return x
-        lo, hi = self.box_lohi
-        pv = self.inp["pixel_values"]
-        return (pv + x.to(pv.dtype)).clamp(lo, hi).to(x.dtype) - pv.to(x.dtype)
+        L, H = LH
+        return torch.minimum(torch.maximum(x.float(), L), H).to(x.dtype)
 
     def _uvec(self, which: str, dev) -> torch.Tensor:
         key = (which, str(dev))
@@ -675,11 +706,12 @@ class VLMTarget:
         out = {"b": float(b.detach()), "s": float(s.detach()), "s_frozen": float(sf.detach()),
                "kept": _kept(o["plan"]) if self.live else self.kept0}
         if grad:
+            tie = getattr(self, "tie", None) if self.leaf == "pixel" else None
             gb = torch.autograd.grad(b, xl, retain_graph=need_gs, allow_unused=True)[0]
-            out["gb"] = (torch.zeros_like(xl) if gb is None else gb).detach().float()
+            out["gb"] = tie_project((torch.zeros_like(xl) if gb is None else gb).detach().float(), tie)
             if need_gs:
                 gs = torch.autograd.grad(s, xl, allow_unused=True)[0]
-                out["gs"] = (torch.zeros_like(xl) if gs is None else gs).detach().float()
+                out["gs"] = tie_project((torch.zeros_like(xl) if gs is None else gs).detach().float(), tie)
             else:
                 out["gs"] = None
         return out
